@@ -225,7 +225,7 @@ tests/test_parity.py         99,419 rows x 22 features = 2,187,218 comparisons  
 tests/test_score_parity.py   30,000 rows x 4 scores                            -> agree
 ```
 
-`app/online_features.py` is an independent reimplementation of the generator's forward pass. Sharing that code would make the test meaningless. The scorer never writes state; `store.commit()` is the caller's job afterwards, so a read-after-write bug shows up instantly as a velocity mismatch.
+`backend.py::build_online_features` is an independent reimplementation of the generator's forward pass. Merging the two into a shared helper would make the test pass while proving nothing, so there's a warning block at the top of `backend.py`. The scorer never writes state; `store.commit()` is the caller's job afterwards, so a read-after-write bug shows up instantly as a velocity mismatch.
 
 Caveat: DynamoDB can't hold an exact trailing-600-second deque, so the planned bucketed windows will diverge from these results. That needs its own measurement before it's trusted.
 
@@ -234,7 +234,7 @@ Caveat: DynamoDB can't hold an exact trailing-600-second deque, so the planned b
 The ML pipeline and the scoring API run today. The DynamoDB adapter, JWT auth and React dashboards do not.
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt        # serve deps + scikit-learn
 
 python ml/generate_dataset.py --n 100000   # ~99k rows -> ml/data/
 python ml/train.py                         # -> ml/artifacts/model.json + calibrator
@@ -248,7 +248,7 @@ Run the service:
 
 ```bash
 set FRAUDSHIELD_API_KEY=devkey
-python -m uvicorn app.main:app --port 8000
+python -m uvicorn backend:app --port 8000
 ```
 
 Startup replays the **train split only** into the entity store, so device, IP and velocity counters are warm — warming from validation or test would leak the evaluation period into serving state. Docs at http://localhost:8000/docs.
@@ -304,22 +304,60 @@ npm run dev
 
 ---
 
+## Deployment
+
+The whole serving path is one module, `backend.py` (~1,050 lines). Deploying means shipping that file plus three model artifacts.
+
+```bash
+docker build -t fraudshield .
+docker run -p 8000:8000 -e FRAUDSHIELD_API_KEY=<secret> fraudshield
+```
+
+Or install it:
+
+```bash
+pip install .          # -> import backend works from any directory
+uvicorn backend:app
+```
+
+What the image deliberately does **not** contain: the dataset generator, the trainer, the evaluator, the batch scorer, the test suite, or the 20 MB dataset CSV. None of it runs in production, and a payment-path container has no business carrying a dataset generator.
+
+It also doesn't contain scikit-learn. That's only needed to *fit* the isotonic calibrator; serving reads the fitted knots from `calibrator.json` and interpolates with numpy. Six runtime dependencies total.
+
+One dependency is inverted on purpose: `build_matrix` lives in `backend.py` and `ml/train.py` imports it from there, rather than the reverse. Serving code is canonical. Two copies of the log1p transforms and column ordering would eventually drift, and the served model would silently score a different matrix than the one it was fitted on — a bug that produces plausible numbers and no error.
+
+Configuration is environment-driven, so nothing needs a code change to deploy:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `FRAUDSHIELD_API_KEY` | *unset* | **Unset means every endpoint is open.** Startup warns. |
+| `FRAUDSHIELD_ARTIFACTS` | `ml/artifacts` | Where `model.json` and friends live |
+| `FRAUDSHIELD_WARM_ROWS` | `40000` | History replayed into the store at boot; `0` in Docker |
+| `FRAUDSHIELD_REVIEW_T` | `5` | Review threshold — an ops parameter, not a model property |
+| `FRAUDSHIELD_BLOCK_T` | `70` | Block threshold |
+
+Two things to know before this goes anywhere real. **Auth is a single shared API key**, not the JWT + role gating in [ARCHITECTURE.md §4](docs/ARCHITECTURE.md) — no per-user identity, no roles, no rate limiting. Put it behind an authenticated gateway. And **a fresh container starts with a cold entity graph**: `WARM_ROWS=0` because the CSV isn't in the image, and the DynamoDB adapter that would warm from real state isn't built. Network risk will under-score until traffic accumulates.
+
 ## Repository layout
 
 ```text
 fraudshield/
-+-- app/                      scoring service -- BUILT
-|   +-- main.py               FastAPI: score, checkout, queue, detail, outcome
-|   +-- scorer.py             ML + rules + network + aggregation + reasons
-|   +-- online_features.py    independent reimpl of the 22 features
-|   +-- store.py              entity state; in-memory, DynamoDB adapter unbuilt
++-- backend.py                THE SERVING PATH, one module (~1,050 lines)
+|                              1. build_matrix -- canonical, ml/ imports it
+|                              2. entity state store (in-memory)
+|                              3. online feature builder (22 features)
+|                              4. scoring: ML + rules + graph + aggregation
+|                              5. FastAPI app
++-- pyproject.toml            pip install . -> import backend works anywhere
++-- Dockerfile                serving image: backend.py + artifacts only
++-- requirements-serve.txt    6 runtime deps, no scikit-learn
++-- requirements-dev.txt      adds sklearn for training
 +-- tests/
 |   +-- test_parity.py        22 features, offline vs online
 |   +-- test_score_parity.py  4 scores, offline vs online
-+-- ml/                       offline pipeline -- BUILT AND VERIFIED
++-- ml/                       OFFLINE ONLY -- never deployed
 |   +-- generate_dataset.py   event simulation + forward feature pass
-|   +-- features.py           shared matrix builder + leakage assertion
-|   +-- scoring.py            rules, entity graph, aggregator, MVP baseline
+|   +-- scoring.py            batch scoring, the parity reference
 |   +-- cost_model.py         rupee cost of every outcome
 |   +-- train.py              XGBoost + isotonic calibration
 |   +-- evaluate.py           thresholds, baselines, cost, fairness slices

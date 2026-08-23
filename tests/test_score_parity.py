@@ -4,8 +4,8 @@ Offline/online SCORE parity.
 test_parity.py proves the 22 features agree. That is necessary but not sufficient:
 the final risk score also depends on the rule layer and the entity-graph network
 layer, and those are implemented twice -- batch in ml/scoring.py, incremental in
-app/scorer.py. If they disagree, the metrics in docs/EVALUATION.md were produced by
-a scorer that is not the one serving traffic.
+backend.py. If they disagree, the metrics in docs/EVALUATION.md were produced by a
+scorer that is not the one serving traffic.
 
 This replays the dataset through the online path and compares the ML score, rule
 score, network score and final aggregate against the batch computation.
@@ -15,7 +15,7 @@ score, network score and final aggregate against the batch computation.
 The network layer is expected to match exactly here because both implementations
 walk the same adjacency in the same time order. It will NOT match once DynamoDB
 bucketed velocity windows replace exact deques -- that divergence needs its own
-measurement, and is called out in app/store.py.
+measurement, and is called out in the DynamoDB mapping note in backend.py.
 """
 
 from __future__ import annotations
@@ -35,8 +35,7 @@ sys.path.insert(0, str(_ROOT / "ml"))
 
 import scoring  # noqa: E402  (ml/scoring.py, the batch implementation)
 
-from app.scorer import Scorer  # noqa: E402
-from app.store import InMemoryStore  # noqa: E402
+from backend import InMemoryStore, Scorer, build_matrix  # noqa: E402
 
 TOL_ML = 0.05        # score points, out of 100
 TOL_RULE = 1e-9
@@ -63,18 +62,13 @@ def run(data: Path, limit: int | None) -> int:
 
     # Batch ML scores, one DMatrix for the whole file (fast path).
     import xgboost as xgb
-    from features import build_matrix
 
     X, names = build_matrix(df)
     dm = xgb.DMatrix(X.to_numpy(), feature_names=names)
     bi = scorer.best_iteration
     raw_p = scorer.booster.predict(dm, iteration_range=(0, bi + 1)) if bi is not None \
         else scorer.booster.predict(dm)
-    ml_batch = np.clip(
-        np.interp(raw_p, scorer._cal_x, scorer._cal_y,
-                  left=scorer._cal_y[0], right=scorer._cal_y[-1]) * 100.0,
-        0, 100,
-    )
+    ml_batch = np.clip(scorer.calibrate(raw_p) * 100.0, 0, 100)
     final_batch = np.clip(
         scoring.W_ML * ml_batch + scoring.W_RULES * rule_batch
         + scoring.W_NETWORK * net_batch,

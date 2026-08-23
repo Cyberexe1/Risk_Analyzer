@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,9 +22,28 @@ from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_s
 
 import scoring
 from cost_model import COSTS, do_nothing_cost, sensitivity, transaction_cost
-from features import build_matrix, load, split_frames
+
+# build_matrix comes from the serving module so training, evaluation and serving
+# all use one implementation. See the note in ml/train.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from backend import build_matrix  # noqa: E402
 
 ARTIFACTS = Path("ml/artifacts")
+
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df.sort_values("ts_epoch", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def split_frames(df: pd.DataFrame):
+    return (
+        df[df.split == "train"].copy(),
+        df[df.split == "validation"].copy(),
+        df[df.split == "test"].copy(),
+    )
 
 
 # ---------------------------------------------------------------------------

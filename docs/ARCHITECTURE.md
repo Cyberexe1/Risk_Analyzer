@@ -10,12 +10,17 @@ System design, data model, authentication and API contract. For scoring internal
 >
 > | Component | Status |
 > | --- | --- |
-> | Online scorer (`app/scorer.py`) | Built, score-parity verified against the batch pipeline |
-> | Entity state store (`app/store.py`) | Built, **in-memory only** — does not survive restart |
-> | FastAPI service (`app/main.py`) | Built: score, checkout, queue, detail, outcome |
+> | Online scorer (`backend.py` §4) | Built, score-parity verified against the batch pipeline |
+> | Entity state store (`backend.py` §2) | Built, **in-memory only** — does not survive restart |
+> | FastAPI service (`backend.py` §5) | Built: score, checkout, queue, detail, outcome |
+> | Packaging | `pyproject.toml` + `Dockerfile`; `pip install .` verified |
 > | Auth | **Single shared API key**, not JWT + roles as described in section 4 |
 > | DynamoDB single-table | **Not built.** Schema in section 3 is a design, not a deployment |
 > | React dashboards | Not built |
+>
+> The entire serving path is one module, `backend.py`. Training, evaluation, the
+> dataset generator and the batch scorer stay in `ml/` and are never deployed —
+> see [README, Deployment](../README.md#deployment) for why.
 >
 > Section 3 (data model) and section 4 (auth) describe the intended design. Treat
 > them as a specification to build against, not a description of running code.
@@ -36,13 +41,17 @@ tests/test_score_parity.py   30,000 rows x 4 scores (ml, rules, network, final)
                              -> all agree
 ```
 
-`app/online_features.py` is a **deliberately independent** implementation of the generator's forward pass. Sharing that code would make the test vacuous — the point is that two separately written paths produce identical output. The one thing they do share is `ml/features.py::build_matrix`, because a second copy of the log1p transforms and column ordering would eventually drift and silently score against a different model.
+`backend.py::build_online_features` is a **deliberately independent** implementation of `ml/generate_dataset.py::compute_features`. Sharing that code would make the test vacuous — the point is that two separately written paths produce identical output.
 
-The tests also pin the read-before-write discipline: `scorer.score()` never mutates state, and `store.commit()` is the caller's job afterwards. A commit that happened before the feature read would show up immediately as a velocity mismatch.
+This is worth guarding. The two functions look similar, they now live in different files, and the obvious "cleanup" is to merge them into a shared helper. Do that and `test_parity.py` still passes while proving only that a function equals itself. There is a warning block at the top of `backend.py` saying so.
+
+The one thing the paths *do* share is `build_matrix`, and that sharing is deliberate in the opposite direction: `backend.py` owns it and `ml/train.py` imports it, so there is exactly one copy of the log1p transforms and the column ordering. Two copies would drift and the served model would silently score a different matrix than it was fitted on.
+
+The tests also pin the read-before-write discipline: `Scorer.score()` never mutates state, and `store.commit()` is the caller's job afterwards. A commit that landed before the feature read would surface immediately as a velocity mismatch.
 
 ### Known future divergence
 
-DynamoDB cannot hold an exact trailing-600-second deque per customer. The schema in section 3 uses bucketed windows (`WINDOW#10M#<epoch//600>`) with TTL, which is an **approximation**. When that adapter is written it will not reproduce these parity results exactly, and it needs its own measurement of how far it drifts before it is trusted. This is flagged in `app/store.py` rather than discovered later.
+DynamoDB cannot hold an exact trailing-600-second deque per customer. The schema in section 3 uses bucketed windows (`WINDOW#10M#<epoch//600>`) with TTL, which is an **approximation**. When that adapter is written it will not reproduce these parity results exactly, and it needs its own measurement of how far it drifts before it is trusted. Flagged in the DynamoDB mapping note in `backend.py` §2 rather than discovered later.
 
 ---
 

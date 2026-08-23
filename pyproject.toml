@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fraudshield"
+version = "0.4.0"
+description = "Defense-only transaction risk scoring: detector, explanation, and decision routing."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+# Runtime only. The training toolchain lives in requirements-dev.txt and is not a
+# dependency of the deployed service.
+dependencies = [
+    "numpy==2.2.1",
+    "pandas==2.3.1",
+    "xgboost==3.0.3",
+    "fastapi==0.115.6",
+    "uvicorn==0.49.0",
+    "pydantic==2.13.4",
+]
+
+[project.optional-dependencies]
+dev = ["scikit-learn==1.7.1"]
+
+# backend.py is the whole serving surface, so it is a single top-level module
+# rather than a package. `pip install .` then makes `import backend` work from any
+# working directory, which is what removes the PYTHONPATH dependency.
+[tool.setuptools]
+py-modules = ["backend"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "ml"]

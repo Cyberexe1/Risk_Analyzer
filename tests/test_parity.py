@@ -3,10 +3,10 @@ Offline/online feature parity.
 
 The central claim behind docs/EVALUATION.md is that features were built the way a
 production scorer would build them. Until now that was an assertion. This test
-replays the generated dataset one transaction at a time through app/store.py and
-app/online_features.py -- which have no access to a sorted file, only to counters
-left behind by earlier traffic -- and compares every feature against the offline
-CSV.
+replays the generated dataset one transaction at a time through the store and
+online feature builder in backend.py -- which have no access to a sorted file,
+only to counters left behind by earlier traffic -- and compares every feature
+against the offline CSV.
 
 If they diverge, the metrics describe a model that cannot ship.
 
@@ -30,8 +30,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.online_features import build  # noqa: E402
-from app.store import InMemoryStore  # noqa: E402
+from backend import InMemoryStore, build_online_features as build  # noqa: E402
 
 EXACT_INT = [
     "transaction_hour", "is_weekend",

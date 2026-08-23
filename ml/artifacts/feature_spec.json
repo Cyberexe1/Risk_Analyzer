@@ -69,5 +69,5 @@
   "scale_pos_weight": 52.533076923076926,
   "best_iteration": 174,
   "data_file": "ml\\data\\transactions.csv",
-  "trained_at": "2026-08-23T05:41:55.322326+00:00"
+  "trained_at": "2026-08-23T08:06:20.058811+00:00"
 }

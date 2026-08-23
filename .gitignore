@@ -17,3 +17,8 @@ ml/data/*.csv
 
 # scratch
 _demo_out.txt
+
+# build
+build/
+*.egg-info/
+*.log
