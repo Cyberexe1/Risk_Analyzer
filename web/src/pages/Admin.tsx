@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useState } from 'react'
-import { api, ApiError, band, rupees, type Health, type QueueItem } from '../api'
+import {
+  api,
+  ApiError,
+  band,
+  promoApi,
+  rupees,
+  type Health,
+  type PromoHold,
+  type QueueItem,
+} from '../api'
 import { Badge, ErrorNote, Reasons, ScoreDial, Stat, SubScoreBars } from '../components'
 
 /**
@@ -12,16 +21,23 @@ import { Badge, ErrorNote, Reasons, ScoreDial, Stat, SubScoreBars } from '../com
  */
 export default function Admin() {
   const [items, setItems] = useState<QueueItem[]>([])
+  const [holds, setHolds] = useState<PromoHold[]>([])
   const [health, setHealth] = useState<Health | null>(null)
   const [selected, setSelected] = useState<QueueItem | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [tab, setTab] = useState<'txn' | 'promo'>('txn')
 
   const refresh = useCallback(async () => {
     try {
-      const [q, h] = await Promise.all([api.queue(), api.health()])
+      const [q, h, p] = await Promise.all([
+        api.queue(),
+        api.health(),
+        promoApi.holds().catch(() => ({ count: 0, items: [] as PromoHold[] })),
+      ])
       setItems(q.items)
       setHealth(h)
+      setHolds(p.items)
       setError(null)
       setSelected((prev) =>
         prev ? (q.items.find((i) => i.transaction_id === prev.transaction_id) ?? null) : null,
@@ -43,6 +59,15 @@ export default function Admin() {
     try {
       await api.outcome(id, label)
       setSelected(null)
+      await refresh()
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    }
+  }
+
+  async function overridePromo(rid: string) {
+    try {
+      await promoApi.override(rid)
       await refresh()
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
@@ -73,14 +98,29 @@ export default function Admin() {
       )}
 
       <div className="grid grid-4" style={{ marginBottom: 20 }}>
-        <Stat k="In queue" v={items.length} n="awaiting a decision" />
+        <Stat k="Txn queue" v={items.length} n="awaiting a decision" />
         <Stat k="Blocked" v={blocked} n="no human in the loop" />
         <Stat k="For review" v={review} n="held, not declined" />
-        <Stat
-          k="Thresholds"
-          v={health?.thresholds ? `${health.thresholds.review} / ${health.thresholds.block}` : '\u2014'}
-          n="review / block"
-        />
+        <Stat k="Promo holds" v={holds.length} n="held or denied claims" />
+      </div>
+
+      <div className="nav-links" style={{ marginBottom: 16, marginLeft: 0 }}>
+        <button
+          className={`nav-link${tab === 'txn' ? ' active' : ''}`}
+          style={{ border: 0, background: 'none', cursor: 'pointer', font: 'inherit' }}
+          onClick={() => setTab('txn')}
+          aria-pressed={tab === 'txn'}
+        >
+          Transactions ({items.length})
+        </button>
+        <button
+          className={`nav-link${tab === 'promo' ? ' active' : ''}`}
+          style={{ border: 0, background: 'none', cursor: 'pointer', font: 'inherit' }}
+          onClick={() => setTab('promo')}
+          aria-pressed={tab === 'promo'}
+        >
+          Promo abuse ({holds.length})
+        </button>
       </div>
 
       {health && !health.model_loaded && (
@@ -90,7 +130,87 @@ export default function Admin() {
         </div>
       )}
 
-      <div className="grid" style={{ gridTemplateColumns: '1fr minmax(320px, 420px)' }}>
+      {tab === 'promo' && (
+        <>
+          <div className="table-shell">
+            <table>
+              <caption className="sr-only">
+                Promotion claims held or denied by the redemption gate
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Status</th>
+                  <th scope="col">Account</th>
+                  <th scope="col">Offer</th>
+                  <th scope="col">Signals</th>
+                  <th scope="col">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {!holds.length && (
+                  <tr>
+                    <td colSpan={5} className="empty">
+                      Nothing held. Claim an offer twice from the same device on the{' '}
+                      <a href="/offers">offers page</a> to see this populate.
+                    </td>
+                  </tr>
+                )}
+                {holds.map((h) => (
+                  <tr key={h.redemption_id}>
+                    <td>
+                      <span
+                        className={`badge badge-${h.decision === 'DENY' ? 'block' : 'review'}`}
+                      >
+                        <span aria-hidden="true">
+                          {h.decision === 'DENY' ? '\u25B2' : '\u25C6'}
+                        </span>
+                        {h.decision === 'DENY' ? 'Denied' : 'Held'}
+                      </span>
+                    </td>
+                    <td className="mono" style={{ fontSize: 13 }}>
+                      {h.email}
+                    </td>
+                    <td>
+                      <span className="mono">{h.promo_code}</span>{' '}
+                      <span className="muted">{rupees(h.value)}</span>
+                    </td>
+                    <td style={{ maxWidth: 340 }}>
+                      <Reasons codes={h.reasons} />
+                      {h.shared_ip_exempt && (
+                        <p className="muted" style={{ fontSize: 12, margin: '6px 0 0' }}>
+                          Shared-IP exemption applied
+                        </p>
+                      )}
+                    </td>
+                    <td>
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => void overridePromo(h.redemption_id)}
+                      >
+                        Grant anyway
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="muted" style={{ marginTop: 12 }}>
+            Overrides are the <strong>only</strong> label source for this gate &mdash; it
+            ships with no training data, so an analyst reversing a decision is how we
+            learn the rules are wrong. Measured on held-out data: precision 0.962, recall
+            0.962, zero legitimate customers denied.
+          </p>
+        </>
+      )}
+
+      <div
+        className="grid"
+        style={{
+          gridTemplateColumns: '1fr minmax(320px, 420px)',
+          display: tab === 'txn' ? 'grid' : 'none',
+        }}
+      >
         {/* ---- queue ---- */}
         <div className="table-shell">
           <table>

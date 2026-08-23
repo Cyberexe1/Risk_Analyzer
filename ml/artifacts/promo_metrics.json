@@ -1,0 +1,193 @@
+{
+  "generated_at": "2026-08-23T13:37:43.227128+00:00",
+  "data_file": "ml\\data\\promo_redemptions.csv",
+  "scored_by": "backend.score_promo (same code path as POST /v1/promo/redeem)",
+  "thresholds": {
+    "device_reuse_deny": 2,
+    "device_accounts_hold": 4,
+    "ip_claims_hold": 2,
+    "fast_signup_seconds": 120.0,
+    "component_hold": 3,
+    "email_similarity_hold": 0.7
+  },
+  "tuned_on_validation": true,
+  "validation_grid_top8": [
+    {
+      "thresholds": {
+        "device_reuse_deny": 2,
+        "device_accounts_hold": 4,
+        "ip_claims_hold": 2,
+        "fast_signup_seconds": 120.0,
+        "component_hold": 3,
+        "email_similarity_hold": 0.7
+      },
+      "cost": 2280.0,
+      "deny_fp": 0,
+      "missed": 4
+    },
+    {
+      "thresholds": {
+        "device_reuse_deny": 2,
+        "device_accounts_hold": 4,
+        "ip_claims_hold": 2,
+        "fast_signup_seconds": 120.0,
+        "component_hold": 4,
+        "email_similarity_hold": 0.7
+      },
+      "cost": 2280.0,
+      "deny_fp": 0,
+      "missed": 4
+    },
+    {
+      "thresholds": {
+        "device_reuse_deny": 2,
+        "device_accounts_hold": 4,
+        "ip_claims_hold": 3,
+        "fast_signup_seconds": 120.0,
+        "component_hold": 3,
+        "email_similarity_hold": 0.7
+      },
+      "cost": 2280.0,
+      "deny_fp": 0,
+      "missed": 4
+    },
+    {
+      "thresholds": {
+        "device_reuse_deny": 2,
+        "device_accounts_hold": 4,
+        "ip_claims_hold": 3,
+        "fast_signup_seconds": 120.0,
+        "component_hold": 4,
+        "email_similarity_hold": 0.7
+      },
+      "cost": 2280.0,
+      "deny_fp": 0,
+      "missed": 4
+    },
+    {
+      "thresholds": {
+        "device_reuse_deny": 2,
+        "device_accounts_hold": 4,
+        "ip_claims_hold": 5,
+        "fast_signup_seconds": 120.0,
+        "component_hold": 3,
+        "email_similarity_hold": 0.7
+      },
+      "cost": 2280.0,
+      "deny_fp": 0,
+      "missed": 4
+    },
+    {
+      "thresholds": {
+        "device_reuse_deny": 2,
+        "device_accounts_hold": 4,
+        "ip_claims_hold": 5,
+        "fast_signup_seconds": 120.0,
+        "component_hold": 4,
+        "email_similarity_hold": 0.7
+      },
+      "cost": 2280.0,
+      "deny_fp": 0,
+      "missed": 4
+    },
+    {
+      "thresholds": {
+        "device_reuse_deny": 2,
+        "device_accounts_hold": 5,
+        "ip_claims_hold": 2,
+        "fast_signup_seconds": 120.0,
+        "component_hold": 3,
+        "email_similarity_hold": 0.7
+      },
+      "cost": 2280.0,
+      "deny_fp": 0,
+      "missed": 4
+    },
+    {
+      "thresholds": {
+        "device_reuse_deny": 2,
+        "device_accounts_hold": 5,
+        "ip_claims_hold": 2,
+        "fast_signup_seconds": 120.0,
+        "component_hold": 4,
+        "email_similarity_hold": 0.7
+      },
+      "cost": 2280.0,
+      "deny_fp": 0,
+      "missed": 4
+    }
+  ],
+  "rows": {
+    "total": 5984,
+    "validation": 898,
+    "test": 898
+  },
+  "abuse_rate": {
+    "overall": 0.08088,
+    "validation": 0.03898,
+    "test": 0.02895
+  },
+  "gate": {
+    "precision": 0.9615,
+    "recall": 0.9615,
+    "fp_rate": 0.00115,
+    "tp": 25,
+    "fp": 1,
+    "fn": 1,
+    "tn": 871
+  },
+  "deny": {
+    "n": 16,
+    "tp": 16,
+    "fp": 0,
+    "precision": 1.0
+  },
+  "hold": {
+    "n": 10,
+    "tp": 9,
+    "fp": 1,
+    "precision": 0.9
+  },
+  "per_rule": {
+    "device_promo_reuse": {
+      "detections": 12,
+      "precision": 1.0,
+      "action": "DENY"
+    },
+    "payout_reuse": {
+      "detections": 6,
+      "precision": 1.0,
+      "action": "DENY"
+    },
+    "device_account_cluster": {
+      "detections": 12,
+      "precision": 1.0,
+      "action": "HOLD"
+    },
+    "ip_burst_fast_signup": {
+      "detections": 18,
+      "precision": 0.9444,
+      "action": "HOLD"
+    },
+    "email_cluster": {
+      "detections": 20,
+      "precision": 1.0,
+      "action": "HOLD"
+    }
+  },
+  "shared_ip_exempt_rows": 34,
+  "cost": {
+    "offer_value": 500.0,
+    "wrong_deny_cost": 760.0,
+    "review_cost": 35.0,
+    "no_gate": 13000.0,
+    "with_gate": 850.0,
+    "net_saving": 12150.0,
+    "false_positive_cost": 35.0
+  },
+  "caveats": [
+    "Rules-only gate tuned on the same generator that produced the abuse patterns. This is the least transferable measurement in the project.",
+    "Real abusers rotate payout destinations and use cloud devices; the generator does neither, so payout-reuse precision is optimistic.",
+    "A denied cashback is not a denied sale, which is the only reason these thresholds are defensible."
+  ]
+}

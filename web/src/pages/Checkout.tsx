@@ -1,110 +1,95 @@
-import { useState } from 'react'
-import {
-  api,
-  ApiError,
-  rupees,
-  type CustomerView,
-  type ScoreResponse,
-} from '../api'
+import { useEffect, useState } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
+import { ApiError, rupees, shopApi, type OrderResult, type Product } from '../api'
 import { ErrorNote, Reasons, ScoreDial, SubScoreBars } from '../components'
+import { useAuth } from '../auth'
 
-const PRODUCTS = [
-  { id: 'p1', name: 'Wireless earbuds', price: 2499 },
-  { id: 'p2', name: 'Mechanical keyboard', price: 6799 },
-  { id: 'p3', name: 'Smartphone', price: 42999 },
-  { id: 'p4', name: 'Phone case', price: 449 },
-]
+/** Stand-in for a real device fingerprint. A production integration would use an
+ *  opaque client-generated hash; this is stable per browser and good enough to
+ *  make device-linkage signals move in a demo. */
+function deviceFingerprint(): string {
+  const k = 'fs_device'
+  let v = localStorage.getItem(k)
+  if (!v) {
+    v = `dev_web_${Math.random().toString(36).slice(2, 10)}`
+    localStorage.setItem(k, v)
+  }
+  return v
+}
 
-const PRESETS = {
-  normal: {
-    label: 'Returning customer',
-    hint: 'Established account, own device, ordinary amount.',
-    customer_id: 'CUST_000123',
-    device_fp: 'dev_000123',
-    ip_hash: 'ip_000123',
-    payment_method: 'upi',
+const PATTERNS = {
+  self: {
+    label: 'This browser (normal)',
+    hint: 'Your own device and network. What an ordinary customer looks like.',
+    device: null as string | null,
+    ip: 'ip_web_self',
     repeats: 1,
-    status: 'success' as const,
   },
   testing: {
-    label: 'Card testing',
-    hint: 'Fresh account hammering one device with mostly declines.',
-    customer_id: 'CUST_DEMO_ATTACK',
-    device_fp: 'dev_demo_attack',
-    ip_hash: 'ip_demo_attack',
-    payment_method: 'card',
-    repeats: 8,
-    status: 'failed' as const,
+    label: 'Card-testing device',
+    hint: 'A device already associated with rapid declined attempts.',
+    device: 'dev_demo_attack',
+    ip: 'ip_demo_attack',
+    repeats: 6,
   },
   ring: {
-    label: 'Ring member',
-    hint: 'One of several fresh accounts sharing a device and IP.',
-    customer_id: `CUST_DEMO_RING_${Math.floor(Math.random() * 6)}`,
-    device_fp: 'dev_demo_ring',
-    ip_hash: 'ip_demo_ring',
-    payment_method: 'wallet',
+    label: 'Shared ring device',
+    hint: 'A device and IP shared by several other fresh accounts.',
+    device: 'dev_demo_ring',
+    ip: 'ip_demo_ring',
     repeats: 2,
-    status: 'success' as const,
   },
 }
 
-type PresetKey = keyof typeof PRESETS
+type PatternKey = keyof typeof PATTERNS
 
-/**
- * Customer checkout, with the analyst view shown side by side.
- *
- * In production these two are never on the same screen. A customer must never
- * see a score or a reason code — telling an attacker which signal fired is free
- * reconnaissance. They are together here only to make the split visible: the
- * left panel is what the shopper gets, the right is what the analyst gets, from
- * the exact same scoring call.
- */
 export default function Checkout() {
-  const [product, setProduct] = useState(PRODUCTS[0])
-  const [preset, setPreset] = useState<PresetKey>('normal')
+  const { user, loading: authLoading } = useAuth()
+  const nav = useNavigate()
+
+  const [products, setProducts] = useState<Product[]>([])
+  const [pid, setPid] = useState('p1')
+  const [method, setMethod] = useState('upi')
+  const [pattern, setPattern] = useState<PatternKey>('self')
   const [busy, setBusy] = useState(false)
-  const [customer, setCustomer] = useState<CustomerView | null>(null)
-  const [analyst, setAnalyst] = useState<ScoreResponse | null>(null)
+  const [result, setResult] = useState<OrderResult | null>(null)
   const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    void shopApi
+      .products()
+      .then((r) => setProducts(r.products))
+      .catch((e) => setError(e instanceof ApiError ? e.message : String(e)))
+  }, [])
+
+  const product = products.find((p) => p.id === pid)
 
   async function pay() {
     setBusy(true)
     setError(null)
-    setCustomer(null)
-    setAnalyst(null)
-    const p = PRESETS[preset]
-    const now = Date.now() / 1000
+    setResult(null)
+    const p = PATTERNS[pattern]
+    const device = p.device ?? deviceFingerprint()
 
     try {
-      // Replay the preset's earlier attempts first so velocity and device
-      // counters actually build. Scoring the last one cold would show nothing.
+      // Build up history first so velocity and device-linkage signals actually
+      // have something to see. A single cold request shows nothing interesting.
       for (let i = 0; i < p.repeats - 1; i++) {
-        await api.score({
-          customer_id: p.customer_id,
-          amount: Math.max(60, Math.round(product.price / 12)),
-          payment_method: p.payment_method,
-          device_fp: p.device_fp,
-          ip_hash: p.ip_hash,
-          ts: now + i * 25,
-          status: p.status,
+        await shopApi.createOrder({
+          product_id: 'p4',
+          payment_method: 'card',
+          device_fp: device,
+          ip_hash: p.ip,
         })
       }
-
-      const body = {
-        customer_id: p.customer_id,
-        amount: product.price,
-        payment_method: p.payment_method,
-        device_fp: p.device_fp,
-        ip_hash: p.ip_hash,
-        ts: now + p.repeats * 25,
-        status: 'success' as const,
-      }
-      // Two calls so both projections of the same decision are visible. A real
-      // checkout calls one endpoint.
-      const view = await api.checkout({ ...body, commit: false })
-      const full = await api.score(body)
-      setCustomer(view)
-      setAnalyst(full)
+      setResult(
+        await shopApi.createOrder({
+          product_id: pid,
+          payment_method: method,
+          device_fp: device,
+          ip_hash: p.ip,
+        }),
+      )
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     } finally {
@@ -112,12 +97,50 @@ export default function Checkout() {
     }
   }
 
+  if (authLoading) {
+    return <div className="wrap section center muted">Checking your session&hellip;</div>
+  }
+
+  if (!user) {
+    return (
+      <div className="wrap-narrow section" style={{ maxWidth: 480 }}>
+        <div className="card card-lift center">
+          <h1 style={{ fontSize: '1.5rem' }}>Sign in to check out</h1>
+          <p>
+            Orders are tied to an account, because the account is what the risk engine
+            builds a history against.
+          </p>
+          <div className="row" style={{ justifyContent: 'center' }}>
+            <button className="btn" onClick={() => nav('/signup')} style={{ flex: '0 0 auto' }}>
+              Create an account
+            </button>
+            <button
+              className="btn btn-ghost"
+              onClick={() => nav('/login', { state: { from: '/checkout' } })}
+              style={{ flex: '0 0 auto' }}
+            >
+              Log in
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const staff = user.role === 'analyst' || user.role === 'admin'
+  const statusColour =
+    result?.status === 'declined'
+      ? 'rgba(242,84,91,.35)'
+      : result?.status === 'verifying'
+        ? 'rgba(242,177,52,.35)'
+        : 'rgba(53,200,138,.35)'
+
   return (
     <div className="wrap section-sm">
       <h1 style={{ fontSize: '1.9rem' }}>Checkout</h1>
-      <p style={{ maxWidth: 620 }}>
-        Pick a product and a behaviour pattern. The same scoring call feeds both panels
-        below.
+      <p style={{ maxWidth: 640 }}>
+        Every order here is real: it is scored, persisted, and shows up in{' '}
+        <Link to="/orders">your orders</Link>.
       </p>
 
       {error && (
@@ -127,19 +150,13 @@ export default function Checkout() {
       )}
 
       <div className="grid" style={{ gridTemplateColumns: 'minmax(300px, 380px) 1fr' }}>
-        {/* ---- cart ---- */}
         <div className="card">
           <h3>Basket</h3>
+
           <div className="field">
             <label htmlFor="product">Product</label>
-            <select
-              id="product"
-              value={product.id}
-              onChange={(e) =>
-                setProduct(PRODUCTS.find((p) => p.id === e.target.value) ?? PRODUCTS[0])
-              }
-            >
-              {PRODUCTS.map((p) => (
+            <select id="product" value={pid} onChange={(e) => setPid(e.target.value)}>
+              {products.map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.name} &mdash; {rupees(p.price)}
                 </option>
@@ -148,111 +165,119 @@ export default function Checkout() {
           </div>
 
           <div className="field">
-            <label htmlFor="preset">Behaviour pattern</label>
+            <label htmlFor="method">Payment method</label>
+            <select id="method" value={method} onChange={(e) => setMethod(e.target.value)}>
+              {['upi', 'card', 'netbanking', 'wallet', 'cod'].map((m) => (
+                <option key={m} value={m}>
+                  {m.toUpperCase()}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="field">
+            <label htmlFor="pattern">Device / network</label>
             <select
-              id="preset"
-              value={preset}
-              onChange={(e) => setPreset(e.target.value as PresetKey)}
+              id="pattern"
+              value={pattern}
+              onChange={(e) => setPattern(e.target.value as PatternKey)}
             >
-              {Object.entries(PRESETS).map(([k, v]) => (
+              {Object.entries(PATTERNS).map(([k, v]) => (
                 <option key={k} value={k}>
                   {v.label}
                 </option>
               ))}
             </select>
             <p className="muted" style={{ marginTop: 8, marginBottom: 0 }}>
-              {PRESETS[preset].hint}
+              {PATTERNS[pattern].hint}
             </p>
           </div>
 
           <div
             className="spread"
-            style={{ borderTop: '1px solid var(--line)', paddingTop: 16, marginTop: 4 }}
+            style={{ borderTop: '1px solid var(--line)', paddingTop: 16 }}
           >
             <span className="muted">Total</span>
             <strong className="mono" style={{ fontSize: 20 }}>
-              {rupees(product.price)}
+              {product ? rupees(product.price) : '\u2014'}
             </strong>
           </div>
 
           <button
             className="btn"
             onClick={pay}
-            disabled={busy}
+            disabled={busy || !product}
             style={{ width: '100%', marginTop: 16 }}
           >
-            {busy ? 'Scoring\u2026' : 'Pay now'}
+            {busy ? 'Processing\u2026' : 'Pay now'}
           </button>
         </div>
 
-        {/* ---- results ---- */}
         <div className="stack">
           <div className="card">
             <div className="spread" style={{ marginBottom: 14 }}>
-              <h3 style={{ margin: 0 }}>What the customer sees</h3>
-              <span className="badge badge-neutral">shopper view</span>
+              <h3 style={{ margin: 0 }}>Result</h3>
+              <span className="badge badge-neutral">{user.role} view</span>
             </div>
-            {!customer && (
+            {!result && (
               <p className="muted" style={{ marginBottom: 0 }}>
                 Nothing yet. Press &ldquo;Pay now&rdquo;.
               </p>
             )}
-            {customer && (
+            {result && (
               <>
-                <div
-                  className="note"
-                  style={{
-                    borderColor:
-                      customer.status === 'declined'
-                        ? 'rgba(242,84,91,.35)'
-                        : customer.status === 'verifying'
-                          ? 'rgba(242,177,52,.35)'
-                          : 'rgba(53,200,138,.35)',
-                  }}
-                >
-                  {customer.message}
+                <div className="note" style={{ borderColor: statusColour }}>
+                  {result.message}
                 </div>
                 <p className="muted" style={{ marginTop: 10, marginBottom: 0 }}>
-                  Order <code>{customer.order_id}</code> &middot; no score, no sub-score, no
-                  reason codes. That is deliberate.
+                  Order <code>{result.order_id}</code> &middot;{' '}
+                  <Link to="/orders">view in your orders</Link>
                 </p>
+                {!staff && (
+                  <p className="muted" style={{ marginTop: 10, marginBottom: 0 }}>
+                    No score, no reason codes. The backend omits them for a{' '}
+                    <code>customer</code> role &mdash; telling an attacker which signal
+                    fired is free reconnaissance.
+                  </p>
+                )}
               </>
             )}
           </div>
 
-          <div className="card">
-            <div className="spread" style={{ marginBottom: 14 }}>
-              <h3 style={{ margin: 0 }}>What the analyst sees</h3>
-              <span className="badge badge-neutral">console view</span>
-            </div>
-            {!analyst && (
-              <p className="muted" style={{ marginBottom: 0 }}>
-                Same transaction, full evidence.
-              </p>
-            )}
-            {analyst && (
+          {/* Only ever populated for staff: the backend does not include `risk`
+              in the response for a customer role. */}
+          {result?.risk && (
+            <div className="card">
+              <div className="spread" style={{ marginBottom: 14 }}>
+                <h3 style={{ margin: 0 }}>Risk detail</h3>
+                <span className="badge badge-neutral">staff only</span>
+              </div>
               <div className="stack" style={{ gap: 20 }}>
-                <ScoreDial score={analyst.risk_score} decision={analyst.decision} />
-                <SubScoreBars sub={analyst.sub_scores} />
+                <ScoreDial
+                  score={result.risk.risk_score}
+                  decision={result.risk.decision}
+                />
+                <SubScoreBars sub={result.risk.sub_scores} />
                 <div>
                   <div className="sub-head" style={{ marginBottom: 8 }}>
                     <span>Why</span>
                   </div>
-                  <Reasons codes={analyst.reason_codes} />
+                  <Reasons codes={result.risk.reason_codes} />
                 </div>
                 <div className="pill-row">
-                  <span className="chip">{analyst.latency_ms} ms</span>
-                  <span className="chip">{analyst.transaction_id}</span>
-                  {analyst.override && <span className="chip">override: {analyst.override}</span>}
-                  {analyst.degraded && <span className="chip">DEGRADED: no model</span>}
+                  <span className="chip">{result.risk.transaction_id}</span>
+                  {result.risk.override && (
+                    <span className="chip">override: {result.risk.override}</span>
+                  )}
                 </div>
                 <p className="muted" style={{ marginBottom: 0 }}>
-                  {Math.round(analyst.risk_score)} is a routing decision, not a verdict.
-                  Ground truth only exists after an investigation or a chargeback.
+                  {Math.round(result.risk.risk_score)} is a routing decision, not a
+                  verdict. Ground truth only exists after an investigation or a
+                  chargeback.
                 </p>
               </div>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

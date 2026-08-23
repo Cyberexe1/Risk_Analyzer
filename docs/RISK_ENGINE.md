@@ -291,6 +291,24 @@ Two guards against over-blocking:
 
 This gate is rules-first on purpose. Promo abuse patterns are structural and stable, the class is small, and a merchant launching a new promotion has zero history to train on. ML here would be over-engineering for the volume.
 
+### Thresholds are tuned, not chosen
+
+The thresholds above were originally hand-picked, and measurement showed the gate **cost more than the abuse it prevented** — net saving of −Rs 15,305, with 36 legitimate customers denied. `device_reuse >= 1` and `device_accounts >= 3` both sit inside the legitimate range, because a shared family tablet genuinely has one prior claim and three accounts.
+
+They are now grid-searched on the validation split against expected cost (`ml/evaluate_promo.py --tune`) and frozen for test:
+
+| Rule input | Hand-picked | Tuned | Legitimate max |
+| --- | --- | --- | --- |
+| `promo_redemptions_on_device` | >= 1 | **>= 2** | 1 |
+| `accounts_on_device_7d` | >= 3 | **>= 4** | 3 |
+| `promo_redemptions_on_ip` | >= 5 | >= 2 | 2 |
+| `component_account_count` | >= 4 | >= 3 | — |
+| `email_pattern_similarity` | >= 0.70 | >= 0.70 | — |
+
+Result: precision 0.962, recall 0.962, **zero legitimate customers denied**, net saving Rs 12,150. Full measurement and its caveats in [EVALUATION.md §3a](EVALUATION.md).
+
+The lesson generalises past this gate. An off-by-one in a threshold is the difference between saving money and destroying it, and only the cost model surfaces that — precision and recall alone both looked *better* on the broken version (recall was 1.000).
+
 ---
 
 ## 6. Aggregation

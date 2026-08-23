@@ -266,8 +266,18 @@ Three pages:
 | Route | What it is |
 | --- | --- |
 | `/` | Landing page: the problem, the three-layer design, and the measured metrics including the unflattering ones |
-| `/checkout` | Storefront. Pick a product and a behaviour pattern, then see **the same scoring call rendered twice** — the shopper's view beside the analyst's |
-| `/admin` | Analyst console: risk-sorted queue, sub-score breakdown, reason codes, and the fraud/legitimate actions that write labels |
+| `/signup` | Create an account. Live password strength, confirm field, show/hide toggle |
+| `/login` | Log in. Returns you to wherever you were headed |
+| `/checkout` | Storefront. Requires sign-in, because the account is what the risk engine builds history against. Creates a **real, persisted, scored order** |
+| `/orders` | Customer dashboard: order history, payment status, return-request flow |
+| `/offers` | Claim a cashback. Toggle "shared device" to watch the promo gate refuse the 2nd through 5th claim |
+| `/admin` | Analyst console, two tabs: transaction queue and promo holds. **Requires `analyst` or `admin`**, enforced server-side |
+
+The header shows **Log in** and **Sign up** when anonymous, and your email, role badge and **Log out** once signed in. The Console link only appears for staff — but that's a courtesy, not a control: the backend checks the role on every admin request.
+
+The same order endpoint returns different things by role. A customer gets status and a message; staff additionally get the risk breakdown. Verified: a customer's order history contains **no** `risk_score`, `decision`, `sub_scores` or `reason_codes` fields at all — they're stripped server-side by an allow-list, not hidden in the client.
+
+To reach the console locally, set `FRAUDSHIELD_DEV_SEED_STAFF=1` and the backend prints a seeded analyst login with a random password at startup. Local development only.
 
 The checkout page puts both projections side by side on purpose. In production they are never on one screen: the shopper gets `{"status":"declined"}` and nothing else, while the analyst gets the score, all three sub-scores and every reason code. Seeing them together makes the split legible.
 
@@ -301,16 +311,10 @@ python ml/generate_dataset.py --fraud-rate 0.10     # demo mode, warns about bas
 python ml/evaluate.py --max-review-rate 0.02        # tighter analyst capacity
 ```
 
-Not built yet:
-
-```bash
-docker compose up -d      # DynamoDB Local + API + web
-make bootstrap            # tables, seed products, demo users
-```
-
-- Storefront: http://localhost:5173/app
-- Admin: http://localhost:5173/admin
+- App: http://localhost:5173
 - API docs: http://localhost:8000/docs
+
+There is no `docker compose` for the full stack and no `make bootstrap` — the backend has a `Dockerfile`, the frontend does not, and there is no orchestration tying them together with the table.
 
 `make bootstrap` prints the demo logins. They exist only in the seeded local table and are never created against a real AWS account.
 
@@ -368,7 +372,28 @@ Configuration is environment-driven, so nothing needs a code change to deploy:
 
 `VITE_API_KEY` is worth dwelling on: anything with a `VITE_` prefix is baked into the built JavaScript and readable by anyone who opens devtools. It exists so the local demo can reach the local backend. In production the browser must never hold the backend key — put a session-authenticated server between them, or implement the JWT flow in [ARCHITECTURE.md §4](docs/ARCHITECTURE.md) and drop the shared key entirely.
 
-Two things to know before this goes anywhere real. **Auth is a single shared API key**, not the JWT + role gating in [ARCHITECTURE.md §4](docs/ARCHITECTURE.md) — no per-user identity, no roles, no rate limiting. Put it behind an authenticated gateway. And **a fresh container starts with a cold entity graph**: `WARM_ROWS=0` because the CSV isn't in the image, and the DynamoDB adapter that would warm from real state isn't built. Network risk will under-score until traffic accumulates.
+### DynamoDB
+
+The table is live: `fraudshield` in `ap-south-1`, `PAY_PER_REQUEST`, TTL enabled on `ttl`. It holds users, refresh tokens, orders and returns.
+
+```bash
+python scripts/create_table.py --check   # report only
+python scripts/create_table.py           # create if absent, idempotent
+```
+
+Then `FRAUDSHIELD_USERS_BACKEND=dynamodb`. Verified across a restart: account, 8 orders and 1 return all survived.
+
+What is **not** in DynamoDB yet: the transaction and entity-counter items, and the review queue. Those still live in process memory, so a restart loses the queue and cools the entity graph — network risk under-scores until traffic rebuilds it. The three GSIs from [ARCHITECTURE.md §3](docs/ARCHITECTURE.md) are also not created, since nothing reads them while the queue is in memory.
+
+### Before this goes anywhere real
+
+**Set `FRAUDSHIELD_COOKIE_SECURE=true` and `FRAUDSHIELD_JWT_SECRET`.** Without the first, the refresh cookie travels over plain HTTP. Without the second, a random key is generated per process: every restart invalidates all sessions, and two uvicorn workers reject each other's tokens.
+
+**On AWS credentials.** Long-lived IAM user keys are the riskiest credential type — they don't expire, and a leak is a standing breach. Prefer an instance/task role and leave the keys blank. If you must use static keys, scope the IAM policy to `GetItem/PutItem/UpdateItem/Query/DeleteItem` on the one table and rotate on a schedule. Never give them a `VITE_` prefix; Vite compiles every `VITE_*` variable into the browser bundle, which would publish your AWS credentials to every visitor.
+
+**A fresh container starts with a cold entity graph.** `WARM_ROWS=0` because the CSV isn't in the image, and there's no DynamoDB adapter for the *transaction* store yet. Network risk under-scores until traffic accumulates.
+
+Still missing from the auth layer: email verification, password reset, and MFA.
 
 ## Repository layout
 
@@ -393,10 +418,17 @@ fraudshield/
 |       +-- api.ts            typed client, risk-band helper
 |       +-- components.tsx    ScoreDial, SubScoreBars, Reasons, Badge, Stat
 |       +-- App.tsx           nav + routing
+|       +-- auth.tsx          access token in memory, silent refresh
 |       +-- pages/
 |           +-- Landing.tsx   marketing + honest metrics
-|           +-- Checkout.tsx  shopper view beside analyst view
+|           +-- Signup.tsx    account creation, strength meter
+|           +-- Login.tsx     sign in
+|           +-- Checkout.tsx  creates a real persisted order
+|           +-- Orders.tsx    customer dashboard: history + returns
 |           +-- Admin.tsx     queue, evidence panel, label actions
++-- scripts/
+|   +-- create_table.py       idempotent DynamoDB table creation
+|   +-- grant_role.py         promote an account to analyst/admin
 +-- .env / .env.example       backend + frontend config
 +-- ml/                       OFFLINE ONLY -- never deployed
 |   +-- generate_dataset.py   event simulation + forward feature pass
@@ -433,6 +465,40 @@ FraudShield detects, explains and routes. It does not, and will not:
 The synthetic data generator writes **labelled rows into a local table**. It has no network egress and cannot target a payment processor. Every capability in this repo operates only on transactions the merchant already owns.
 
 ---
+
+## Build status
+
+Verified working end to end:
+
+| Area | State |
+| --- | --- |
+| Dataset generator | 99,373 rows, no-lookahead features, self-reported difficulty check |
+| Training + calibration | XGBoost, isotonic, early stop at 174/400 |
+| Evaluation | Thresholds, baselines, rupee cost, fairness slices, worked SHAP example |
+| Offline/online parity | 2,187,218 feature comparisons + 30,000 score comparisons agree |
+| Scoring service | `/v1/risk/score`, `/v1/checkout`, ~25 ms p50 |
+| Auth | Argon2id, JWT, rotating refresh with theft detection, role gating |
+| Orders + returns | Persisted to DynamoDB, survive restart |
+| Promo abuse gate | Tuned on validation, measured on test: precision 0.962, **0 legitimate denials**, Rs 12,150 saved |
+| Frontend | Landing, signup, login, checkout, customer orders, analyst console |
+| DynamoDB | `fraudshield` table live, holds users, tokens, orders, returns |
+
+### Not done
+
+Ordered by how much they'd matter to a reviewer.
+
+| Gap | Why it matters |
+| --- | --- |
+| **Review queue is in process memory** | A backend restart loses the queue. Analyst decisions in flight vanish. |
+| **Entity counters are in process memory** | A restart cools the graph, so network risk under-scores until traffic rebuilds it. The DynamoDB transaction store is designed in `ARCHITECTURE.md` §3 but not written — and its bucketed velocity windows will break exact score parity, which needs its own measurement. |
+| **Rule layer hurts precision** | 0.370 vs 0.675 for XGBoost alone. Measured, reported, deliberately not tuned away. The fix (require nonzero ML contribution before rules can escalate) would weaken the cold-start argument, so it needs a decision rather than a patch. |
+| **Review threshold has no controller** | It's a constant tuned against a capacity ceiling. It held on validation (3.83%) and breached on test (4.89%). Production needs a controller targeting a queue rate. |
+| **Returns are recorded but never scored** | Refund abuse sits at 0.455 recall at payment time. Every return routes to a human, which is correct but manual. |
+| No GSIs | The three indexes in `ARCHITECTURE.md` §3 aren't created. Nothing reads them while the queue is in memory. |
+| No email verification, password reset, or MFA | Anyone can register any address. |
+| Landing page metrics are hardcoded | They match `metrics.json` today but won't track a retrain automatically. |
+| No CI, no compose, no frontend Dockerfile | Parity tests and builds are run by hand. |
+| First-party abuse recall 0.000 | Not fixable here by design — needs delivery evidence, not payment features. |
 
 ## Docs
 

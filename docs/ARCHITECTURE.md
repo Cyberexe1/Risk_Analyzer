@@ -4,9 +4,10 @@ System design, data model, authentication and API contract. For scoring internal
 
 ---
 
-> **Build status.** Sections describing the scoring service and its layers are
-> implemented and verified. The **DynamoDB adapter, JWT auth and React dashboards
-> are not built.** Concretely:
+> **Build status.** The scoring service, promo abuse gate, JWT auth, React
+> dashboards and the DynamoDB user/order store are built and verified. Still
+> unbuilt: the **DynamoDB transaction/entity store** (counters and the review
+> queue remain in process memory) and the **three GSIs** in section 3. Concretely:
 >
 > | Component | Status |
 > | --- | --- |
@@ -14,9 +15,14 @@ System design, data model, authentication and API contract. For scoring internal
 > | Entity state store (`backend.py` §2) | Built, **in-memory only** — does not survive restart |
 > | FastAPI service (`backend.py` §5) | Built: score, checkout, queue, detail, outcome |
 > | Packaging | `pyproject.toml` + `Dockerfile`; `pip install .` verified |
-> | Auth | **Single shared API key**, not JWT + roles as described in section 4 |
-> | DynamoDB single-table | **Not built.** Schema in section 3 is a design, not a deployment |
-> | React dashboards | Not built |
+> | User auth (`backend.py` §5) | Built: Argon2id, JWT access, rotating refresh with theft detection, role gating |
+> | User store | Built. **DynamoDB live** (`fraudshield`, ap-south-1); in-memory fallback |
+> | Orders / returns | Built and persisted: `POST /v1/orders`, `GET /v1/orders`, `POST /v1/returns` |
+> | Customer dashboard | Built: `/orders` — history, status, return-request flow |
+> | Service auth | Shared API key on `/v1/risk/score` and `/v1/checkout` only |
+> | Frontend (`web/`) | Built: landing, checkout, console, signup, login |
+> | DynamoDB single-table | **Created** via `scripts/create_table.py`, PAY_PER_REQUEST, TTL on `ttl`. Holds users, refresh tokens, orders, returns. **No GSIs** and the transaction/entity store is still in-memory |
+> | React dashboards | Built: landing, checkout, customer orders, analyst console |
 >
 > The entire serving path is one module, `backend.py`. Training, evaluation, the
 > dataset generator and the batch scorer stay in `ml/` and are never deployed —
@@ -152,6 +158,18 @@ Failing open to `ALLOW` would make the engine trivially bypassable by inducing e
 
 Single table, `fraudshield`, on-demand capacity. Key schema `PK` (partition) + `SK` (sort).
 
+> **Deployed, partially.** `scripts/create_table.py` creates the base table with
+> TTL on the `ttl` attribute. Live item types: `USER`, `EMAIL` index, `RT#`
+> refresh tokens, `ORDER#`, `RETURN#`, and an `INDEX#ORDER` lookup.
+>
+> Not created: **the three GSIs below**, and the transaction / device / IP
+> counter items. Each GSI bills separately, and nothing reads them yet — the
+> admin queue and the entity graph both still run from process memory, so a
+> backend restart loses the queue and cools the graph. The `Order` item shape
+> below also differs slightly from what the code writes (`ORDER#<iso>#<id>`
+> rather than `TXN#<ts>#<id>`), because orders and scored transactions turned out
+> to need separate records.
+
 ### Item types
 
 | Entity | PK | SK | Notable attributes |
@@ -167,8 +185,10 @@ Single table, `fraudshield`, on-demand capacity. Key schema `PK` (partition) + `
 | IP counters | `IP#<hash>` | `COUNTERS` | `account_count`, `txn_count`, `first_seen` |
 | IP edge | `IP#<hash>` | `ACCT#<customer_id>` | `first_seen` |
 | Review queue | `QUEUE#<yyyy-mm-dd>` | `RISK#<zero-padded>#<txn_id>` | denormalised summary for the admin list |
-| Promo redemption | `PROMO#<promo_code>` | `REDEEM#<ts>#<customer_id>` | `decision`, `reasons`, `device_fp`, `ip_hash`, `payout_hash` |
-| Payout destination | `PAYOUT#<payout_hash>` | `REDEEM#<promo_code>#<customer_id>` | `redeemed_at` — powers payout-reuse detection |
+| Promo redemption | `CUSTOMER#<id>` | `PROMO#<code>#<iso>` | `decision`, `status`, `reasons`, `features`, `override_by` |
+| Promo device counter | `PROMODEV#<fp>` | `<code>#<iso>#<customer_id>` | Written even on DENY, so a retry from a new account sees the history |
+| Promo IP counter | `PROMOIP#<hash>` | `<code>#<iso>#<customer_id>` | |
+| Payout destination | `PAYOUT#<ref>` | `<code>#<iso>#<customer_id>` | Powers payout-reuse detection. **Not** written on DENY — a denied claim never pays out, so blocking that destination forever would punish a legitimate retry |
 | Label | `LABEL#<txn_id>` | `OUTCOME` | `label`, `source` (`analyst` / `chargeback`), `decided_at`, `analyst_id` |
 | Audit | `AUDIT#<yyyy-mm-dd>` | `<ts>#<event_id>` | `actor`, `action`, `target`, `before`, `after` |
 
@@ -212,14 +232,25 @@ Short-window counters use bucketed sort keys (`WINDOW#10M#<epoch/600>`) plus Dyn
 
 ## 4. Authentication
 
-> **Not built.** The running service uses a single shared API key from
-> `FRAUDSHIELD_API_KEY`, checked with `secrets.compare_digest` on every guarded
-> route. If that variable is unset, **all endpoints are open** and the service
-> prints a warning at startup. It binds `127.0.0.1` and should stay there.
+> **Built, with one gap.** Implemented in `backend.py` §5 and verified end to end:
+> Argon2id hashing (64 MiB, t=3, p=4), JWT HS256 access tokens at 15 min, opaque
+> 256-bit refresh tokens stored SHA-256 hashed in an httpOnly cookie, single-use
+> rotation with **family revocation on reuse**, login rate limits (5/email and
+> 20/client per 15 min), and identical response text and timing for unknown-email
+> versus wrong-password.
 >
-> What the API key does not give you: per-user identity, analyst/admin role
-> separation, rate limiting, or session revocation. The design below is what
-> should replace it.
+> Admin routes now require `role in {analyst, admin}` via a FastAPI dependency.
+> The shared API key is **no longer accepted** there — it guards only
+> `/v1/risk/score` and `/v1/checkout`, where a payment gateway calling
+> server-side genuinely has no user session.
+>
+> Self-service signup always produces a `customer`. There is no API path to a
+> privileged role; promotion is `scripts/grant_role.py`.
+>
+> **The gap: the default user store is in-memory, so accounts vanish on restart.**
+> The DynamoDB adapter matching section 3 is written but opt-in via
+> `FRAUDSHIELD_USERS_BACKEND=dynamodb`, because enabling it creates billable AWS
+> resources. Also unbuilt: email verification, password reset, MFA.
 
 DynamoDB is the credential store. No Cognito, so that the whole flow is inspectable in a demo.
 
@@ -274,14 +305,22 @@ All routes are prefixed `/v1`. Full OpenAPI at `/docs`.
 
 ### Customer (role `customer`)
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| POST | `/orders` | Create order, triggers scoring |
-| GET | `/orders` | Order history |
-| GET | `/orders/{id}` | Order detail, customer-safe status only |
-| POST | `/returns` | Request a return, triggers return-risk scoring |
-| POST | `/promo/redeem` | Claim an offer, triggers the redemption gate |
-| POST | `/risk/score` | Internal, called by the order flow |
+| Method | Path | Purpose | Status |
+| --- | --- | --- | --- |
+| POST | `/orders` | Create order, score it, persist it | Built |
+| GET | `/orders` | Order history | Built |
+| GET | `/orders/{id}` | Order detail, customer-safe projection | Built |
+| POST | `/returns` | Request a return | Built |
+| GET | `/returns` | Return history | Built |
+| GET | `/catalog/products` | Product list | Built |
+| GET | `/promo/offers` | Available offers | Built |
+| POST | `/promo/redeem` | Claim an offer, triggers the redemption gate | Built |
+| GET | `/promo/mine` | Your claims | Built |
+| POST | `/risk/score` | Service-to-service scoring, shared API key | Built |
+
+The order response is **role-dependent**: a `customer` gets `order_id`, `status` and a message; `analyst`/`admin` additionally get `risk` with the score, sub-scores and reason codes. Enforced server-side in `_customer_order_view`, which is allow-list based — adding a field to the stored record cannot leak it to customers by default.
+
+`GET /orders/{id}` returns the same 404 whether the order does not exist or belongs to another account. A distinguishable response would let a caller enumerate other people's orders. Verified: a second account reading the first account's order gets 404, and its own history returns 0.
 
 ### Admin (role `admin` or `analyst`)
 

@@ -2,13 +2,11 @@
 
 Held-out metrics, the false-positive cost model, how thresholds were chosen, and what this system gets wrong. The track bar is *honest metrics including false-positive cost* — this document is that bar.
 
-> **Status.** Sections 1 and 2 describe the dataset that `ml/generate_dataset.py`
-> actually produces — those numbers are real and reproducible today. Sections 3
-> onward are **projected operating points**, not measured results: `train.py` and
-> `evaluate.py` are not built yet, so no model has been fitted to this data. They
-> are written to define what will be reported and how it will be costed. Every one
-> will be replaced by `ml/artifacts/metrics.json` once training runs, and any
-> figure that disagrees with that artifact is wrong.
+> **Status. Everything in this document is measured.** Transaction metrics
+> regenerate into `ml/artifacts/metrics.json` via `ml/evaluate.py`; promo-gate
+> metrics into `ml/artifacts/promo_metrics.json` via `ml/evaluate_promo.py --tune`.
+> If a number here disagrees with an artifact, the artifact is right and this file
+> is stale.
 
 ---
 
@@ -214,78 +212,117 @@ The obvious fix — requiring a nonzero ML contribution before the rule layer ca
 
 ## 3a. Promotion abuse — evaluated separately
 
-> **Still projected, not measured.** `generate_dataset.py` produces
-> `ml/data/promo_redemptions.csv` (5,984 rows, 8.09% abuse), but no scorer or
-> evaluation exists for the redemption gate yet. The numbers below are a target,
-> not a result. Section 3 is measured; this section is not.
+Measured. `python ml/evaluate_promo.py --tune`, output in `ml/artifacts/promo_metrics.json`. Scored by `backend.score_promo` — the same function `POST /v1/promo/redeem` calls, so these numbers describe the code that serves traffic.
 
-Promo abuse is scored at redemption, not at checkout, so it has a different population and a different denominator. Folding it into the transaction metrics above would be wrong. It gets its own numbers.
+Promo abuse is scored at redemption, not at checkout, so it has a different population and a different denominator. Folding it into the transaction metrics above would be wrong.
 
 | Property | Value |
 | --- | --- |
-| Promo redemptions generated | 5,984 |
-| Abuse rate | 8.09% |
+| Redemptions | 5,984 (train 4,188 / validation 898 / test 898) |
+| Abuse rate | 8.09% overall, 3.90% validation, **2.90% test** |
 | Offer value | Rs 500 |
 
-Note the base rate: **8.09%, against 2.29% for payment fraud in the test split**. Promo abuse is far more common than card fraud because it is low-risk and low-effort for the abuser — no stolen credentials needed, just a second email address.
+The splits are badly unbalanced: the generator concentrated abusive clusters early, so train carries 10.1% abuse and test only 2.90%. **The test split has 26 positives.** Every rate below has a wide confidence interval and should be read as indicative.
+
+### The first version cost more than the abuse it prevented
+
+The thresholds originally documented here were hand-picked — the exact failing this project criticises in the transaction scorer. Measured, they were catastrophic:
+
+```text
+hand-picked (device_reuse >= 1, device_accounts >= 3)
+  recall 1.000, precision 0.321
+  36 legitimate customers DENIED
+  net saving  -Rs 15,305     <- worse than having no gate at all
+```
+
+The cause was an off-by-one against reality. Legitimate shared family devices genuinely have **one** prior claim and **three** accounts:
+
+```text
+promo_redemptions_on_device   legit {0: 5285, 1: 215}          abuse {0:189, 1:64, 2:70, 3:54, ...}
+accounts_on_device_7d         legit {1: 5198, 2: 144, 3: 158}  abuse {1:174, 2:71, 3:65, 4:59, ...}
+payout_destination_reuse      legit {0: 5500}                  abuse {0:255, 1:229}
+```
+
+Thresholds of `>= 1` and `>= 3` sit *inside* the legitimate range. So the gate denied every family tablet. Because a wrong denial costs Rs 760 and the abuse it prevents costs Rs 500, denying aggressively loses money by construction.
+
+### Tuned on validation, frozen for test
+
+`--tune` grid-searches the five thresholds against expected cost on validation only:
+
+| Threshold | Hand-picked | Tuned |
+| --- | --- | --- |
+| `device_reuse_deny` | 1 | **2** |
+| `device_accounts_hold` | 3 | **4** |
+| `ip_claims_hold` | 5 | 2 |
+| `component_hold` | 4 | 3 |
+| `email_similarity_hold` | 0.70 | 0.70 |
+
+The first two are the ones that matter, and both land exactly one above the legitimate maximum.
 
 ### Confusion matrix at the redemption gate
+
+Test split, 898 redemptions, 26 abusive. HOLD or DENY counts as flagged.
 
 ```text
                    predicted
               DENY/HOLD    ALLOW
-actual  abuse       48        13     recall     0.787
-        legit        8       743     FP rate    0.0107
+actual  abuse       25         1     recall     0.962
+        legit        1       871     FP rate    0.0011
                   ----     -----
-                    56       756     precision  0.857
+                    26       872     precision  0.962
 ```
 
-Precision 0.857 and recall 0.787 — substantially better than the payment scorer, because the signal is structural rather than behavioural. Five accounts paying cashback into one UPI ID is not ambiguous the way a large purchase is.
+Split by action, because a DENY is consequential and a HOLD is nearly free:
 
-Which signal caught what, among the 48 detections:
+| Action | Rows | Precision | Legitimate customers affected |
+| --- | --- | --- | --- |
+| DENY | 16 | **1.000** | **0** |
+| HOLD | 10 | 0.900 | 1 (costs Rs 35) |
 
-| Signal | Detections | Precision |
-| --- | --- | --- |
-| Payout destination reuse | 29 | 1.00 |
-| Same promo on same device | 24 | 0.96 |
-| `>= 3` accounts on device in 7 days | 19 | 0.79 |
-| IP clustering + fast signup | 11 | 0.64 |
-| Email pattern similarity | 9 | 0.67 |
+### Per-signal precision
 
-Detections overlap, so the column sums past 48. Payout reuse produced **zero** false positives in the test week — no legitimate pair of customers shared a cashback destination. The device-count and IP-clustering rules carry all of the error, which is expected: those are the ones with innocent explanations.
+| Signal | Fired | Precision | Action |
+| --- | --- | --- | --- |
+| `payout_reuse` | 6 | 1.000 | DENY |
+| `device_promo_reuse` | 12 | 1.000 | DENY |
+| `device_account_cluster` | 12 | 1.000 | HOLD |
+| `email_cluster` | 20 | 1.000 | HOLD |
+| `ip_burst_fast_signup` | 18 | 0.944 | HOLD |
+
+Signals overlap, so the column sums past 26. Payout reuse is the one that closes a case: devices and IPs have innocent explanations — a family tablet, an office network, hostel wifi — but five accounts paying cashback into one UPI ID does not. The shared-IP exemption fired on 34 test rows (3.8%), suppressing IP-only signals where the component looked like carrier or campus infrastructure.
 
 ### Cost
 
 | Event | Cost |
 | --- | --- |
 | Abusive redemption allowed | Rs 500 — offer value, straight loss |
-| Legitimate redemption wrongly denied | Rs 500 offer withheld + Rs 260 goodwill/support = **Rs 760** |
+| Legitimate redemption wrongly denied | Rs 500 offer + Rs 260 goodwill/support = **Rs 760** |
 | Review of a held redemption | Rs 35 |
 
 ```text
-without gate     61 abusive x Rs 500     = Rs 30,500
+no gate        26 abusive x Rs 500        = Rs 13,000
 
 with gate
-  abuse blocked          48 x Rs   0      = Rs      0
-  abuse missed           13 x Rs 500      = Rs  6,500
-  legit wrongly denied    8 x Rs 760      = Rs  6,080
-  reviews                56 x Rs  35      = Rs  1,960
-                                            ----------
-  total                                     Rs 14,540
+  abuse denied/held      25               = Rs      0
+  abuse missed            1 x Rs 500      = Rs    500
+  legit wrongly denied    0 x Rs 760      = Rs      0
+  reviews                10 x Rs  35      = Rs    350
+                                            ---------
+  total                                     Rs    850
 
-net saving                                  Rs 15,960   (52.3%)
-false-positive cost                         Rs  6,080   (41.8% of remaining cost)
+net saving                                  Rs 12,150   (93.5%)
+false-positive cost                         Rs     35   (4.1% of remaining)
 ```
 
-Two honest observations:
+### Two honest readings
 
-**The saving is real but modest.** Rs 16,000 a week against Rs 3.88 lakh from the payment scorer. Promo abuse is a smaller pot. It is worth building because detection is cheap and reuses the graph we already maintain, not because it is the big win.
+**The pot is small.** Rs 12,150 on the test split against Rs 9.40 lakh from the payment scorer. Promo abuse is worth catching because the detection is cheap and reuses the entity graph that already exists — not because it moves the headline number.
 
-**False positives are a much larger share of remaining cost here — 42% versus 17% at checkout.** With a 7.5% base rate and deliberately aggressive denial rules, we wrongly deny 8 real customers a week. That is acceptable only because a denied cashback is not a denied sale and there is a one-click override path. If this gate were refusing purchases instead of offers, these thresholds would be indefensible.
+**Precision 0.962 with zero wrong denials is not credible as a production forecast.** It is the same problem as the transaction block gate's 1.000: the tuned thresholds land exactly on boundaries the generator created (`legit` tops out at 1, `abuse` starts at 2). A real population would not have such a clean gap.
 
 ### Caveat
 
-This gate is rules-only and was tuned on the same generator that produced the abuse patterns. The 0.857 precision is therefore the **least transferable number in this document** — more so than the ring-detection figure. Real promo abusers rotate payout destinations and use cloud devices; our generator does neither. Read this as a demonstration that the entity graph supports the use case, not as a performance prediction.
+Rules-only, tuned on the same generator that produced the abuse patterns, evaluated on 26 positives. This is the **least transferable measurement in the project** — more so than ring detection. Real promo abusers rotate payout destinations and use cloud devices; our generator does neither, so `payout_reuse` precision of 1.000 is optimistic by construction. Read this as evidence that the entity graph supports the use case, and that the cost model catches a badly-tuned gate, not as a performance prediction.
 
 ---
 
@@ -504,14 +541,13 @@ The synthetic data generator produces labelled rows in a local DynamoDB table. I
 ## Reproducing
 
 ```bash
-# built and verified
 python ml/generate_dataset.py --n 100000            # 2% fraud, 180 days
+python ml/train.py                                  # -> model.json, calibrator.json
+python ml/evaluate.py                               # -> metrics.json
+
 python ml/generate_dataset.py --n 20000 --tag dev   # fast iteration loop
 python ml/generate_dataset.py --fraud-rate 0.10 --tag demo
-
-# not built yet
-python ml/train.py
-python ml/evaluate.py
+python ml/evaluate.py --max-review-rate 0.02        # tighter analyst capacity
 ```
 
 Seed is fixed at `20260822`. Same seed, same rows, same counts — the numbers in sections 1 and 2 reproduce exactly.

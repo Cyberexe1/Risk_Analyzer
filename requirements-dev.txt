@@ -1,7 +1,8 @@
-# Full toolchain: dataset generation, training, evaluation, parity tests.
+﻿# Full toolchain: dataset generation, training, evaluation, parity tests.
 # Never install this in a serving container.
 
 -r requirements-serve.txt
 
 # Only used to fit the isotonic calibrator and compute evaluation metrics.
 scikit-learn==1.7.1
+
