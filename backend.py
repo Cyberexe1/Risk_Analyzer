@@ -68,6 +68,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 _HERE = Path(__file__).resolve().parent
@@ -78,6 +79,17 @@ DATA_CSV = Path(os.environ.get("FRAUDSHIELD_DATA", _HERE / "ml" / "data" / "tran
 
 API_KEY = os.environ.get("FRAUDSHIELD_API_KEY", "")
 WARM_ROWS = int(os.environ.get("FRAUDSHIELD_WARM_ROWS", "40000"))
+
+# Explicit origin allow-list. Never "*" -- a wildcard with credentials is rejected
+# by browsers anyway, and a wildcard without them still lets any site read
+# responses from a service that returns fraud reason codes.
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        "FRAUDSHIELD_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+    ).split(",")
+    if o.strip()
+]
 
 
 # =============================================================================
@@ -860,6 +872,14 @@ app = FastAPI(
                 "evidence, never a fraud verdict.",
     version="0.4.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,   # auth is a header key, not a cookie
+    allow_methods=["GET", "POST"],
+    allow_headers=["x-api-key", "content-type"],
 )
 
 

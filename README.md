@@ -253,6 +253,24 @@ python -m uvicorn backend:app --port 8000
 
 Startup replays the **train split only** into the entity store, so device, IP and velocity counters are warm — warming from validation or test would leak the evaluation period into serving state. Docs at http://localhost:8000/docs.
 
+Run the frontend (needs the backend up):
+
+```bash
+cd web
+npm install
+npm run dev          # http://localhost:5173
+```
+
+Three pages:
+
+| Route | What it is |
+| --- | --- |
+| `/` | Landing page: the problem, the three-layer design, and the measured metrics including the unflattering ones |
+| `/checkout` | Storefront. Pick a product and a behaviour pattern, then see **the same scoring call rendered twice** — the shopper's view beside the analyst's |
+| `/admin` | Analyst console: risk-sorted queue, sub-score breakdown, reason codes, and the fraud/legitimate actions that write labels |
+
+The checkout page puts both projections side by side on purpose. In production they are never on one screen: the shopper gets `{"status":"declined"}` and nothing else, while the analyst gets the score, all three sub-scores and every reason code. Seeing them together makes the split legible.
+
 A card-testing burst against one device, nine attempts 35 seconds apart:
 
 ```text
@@ -265,6 +283,15 @@ A card-testing burst against one device, nine attempts 35 seconds apart:
 The rule layer only joins at attempt 7, when `velocity_breach` crosses 5-in-10-minutes. The model had it at attempt 2. Same transaction through `/v1/checkout` returns `{"status":"declined","message":"We couldn't process this payment..."}` — no score, no sub-score, no reason code. Telling an attacker which signal fired is free reconnaissance.
 
 Roughly two minutes total on a laptop. The generator prints its own difficulty report — per-feature AUC and how much fraud no simple rule catches — and warns if any single feature separates the classes too well. `evaluate.py` prints the full threshold sweep, baseline comparison, cost breakdown, fairness slices and one worked SHAP explanation.
+
+### Configure
+
+```bash
+copy .env.example .env
+python -c "import secrets; print(secrets.token_urlsafe(32))"   # paste into .env
+```
+
+`.env` and `web/.env` are gitignored; `.env.example` is committed and holds no secrets.
 
 Useful flags:
 
@@ -335,6 +362,11 @@ Configuration is environment-driven, so nothing needs a code change to deploy:
 | `FRAUDSHIELD_WARM_ROWS` | `40000` | History replayed into the store at boot; `0` in Docker |
 | `FRAUDSHIELD_REVIEW_T` | `5` | Review threshold — an ops parameter, not a model property |
 | `FRAUDSHIELD_BLOCK_T` | `70` | Block threshold |
+| `FRAUDSHIELD_CORS_ORIGINS` | `localhost:5173` | Explicit allow-list, never `*` |
+| `VITE_API_BASE` | `localhost:8000` | Frontend → backend (in `web/.env`) |
+| `VITE_API_KEY` | *unset* | **Compiled into the JS bundle. Not a secret.** |
+
+`VITE_API_KEY` is worth dwelling on: anything with a `VITE_` prefix is baked into the built JavaScript and readable by anyone who opens devtools. It exists so the local demo can reach the local backend. In production the browser must never hold the backend key — put a session-authenticated server between them, or implement the JWT flow in [ARCHITECTURE.md §4](docs/ARCHITECTURE.md) and drop the shared key entirely.
 
 Two things to know before this goes anywhere real. **Auth is a single shared API key**, not the JWT + role gating in [ARCHITECTURE.md §4](docs/ARCHITECTURE.md) — no per-user identity, no roles, no rate limiting. Put it behind an authenticated gateway. And **a fresh container starts with a cold entity graph**: `WARM_ROWS=0` because the CSV isn't in the image, and the DynamoDB adapter that would warm from real state isn't built. Network risk will under-score until traffic accumulates.
 
@@ -355,6 +387,17 @@ fraudshield/
 +-- tests/
 |   +-- test_parity.py        22 features, offline vs online
 |   +-- test_score_parity.py  4 scores, offline vs online
++-- web/                      React 18 + Vite + TypeScript -- BUILT
+|   +-- src/
+|       +-- styles.css        design tokens; radius is a scale, not scattered values
+|       +-- api.ts            typed client, risk-band helper
+|       +-- components.tsx    ScoreDial, SubScoreBars, Reasons, Badge, Stat
+|       +-- App.tsx           nav + routing
+|       +-- pages/
+|           +-- Landing.tsx   marketing + honest metrics
+|           +-- Checkout.tsx  shopper view beside analyst view
+|           +-- Admin.tsx     queue, evidence panel, label actions
++-- .env / .env.example       backend + frontend config
 +-- ml/                       OFFLINE ONLY -- never deployed
 |   +-- generate_dataset.py   event simulation + forward feature pass
 |   +-- scoring.py            batch scoring, the parity reference

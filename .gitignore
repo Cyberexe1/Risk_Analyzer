@@ -22,3 +22,8 @@ _demo_out.txt
 build/
 *.egg-info/
 *.log
+
+# frontend
+web/node_modules/
+web/dist/
+web/.env
