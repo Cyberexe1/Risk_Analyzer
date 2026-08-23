@@ -4,6 +4,48 @@ System design, data model, authentication and API contract. For scoring internal
 
 ---
 
+> **Build status.** Sections describing the scoring service and its layers are
+> implemented and verified. The **DynamoDB adapter, JWT auth and React dashboards
+> are not built.** Concretely:
+>
+> | Component | Status |
+> | --- | --- |
+> | Online scorer (`app/scorer.py`) | Built, score-parity verified against the batch pipeline |
+> | Entity state store (`app/store.py`) | Built, **in-memory only** — does not survive restart |
+> | FastAPI service (`app/main.py`) | Built: score, checkout, queue, detail, outcome |
+> | Auth | **Single shared API key**, not JWT + roles as described in section 4 |
+> | DynamoDB single-table | **Not built.** Schema in section 3 is a design, not a deployment |
+> | React dashboards | Not built |
+>
+> Section 3 (data model) and section 4 (auth) describe the intended design. Treat
+> them as a specification to build against, not a description of running code.
+
+---
+
+## 0. Offline/online parity — the claim this architecture rests on
+
+Every metric in [EVALUATION.md](EVALUATION.md) was produced by a batch pass over a sorted CSV. Production has no sorted CSV. It has one transaction and whatever counters earlier traffic left behind.
+
+If those two paths disagree, the metrics describe a model that cannot ship. So the agreement is tested rather than asserted:
+
+```text
+tests/test_parity.py         99,419 rows x 22 features = 2,187,218 comparisons
+                             -> all agree
+
+tests/test_score_parity.py   30,000 rows x 4 scores (ml, rules, network, final)
+                             -> all agree
+```
+
+`app/online_features.py` is a **deliberately independent** implementation of the generator's forward pass. Sharing that code would make the test vacuous — the point is that two separately written paths produce identical output. The one thing they do share is `ml/features.py::build_matrix`, because a second copy of the log1p transforms and column ordering would eventually drift and silently score against a different model.
+
+The tests also pin the read-before-write discipline: `scorer.score()` never mutates state, and `store.commit()` is the caller's job afterwards. A commit that happened before the feature read would show up immediately as a velocity mismatch.
+
+### Known future divergence
+
+DynamoDB cannot hold an exact trailing-600-second deque per customer. The schema in section 3 uses bucketed windows (`WINDOW#10M#<epoch//600>`) with TTL, which is an **approximation**. When that adapter is written it will not reproduce these parity results exactly, and it needs its own measurement of how far it drifts before it is trusted. This is flagged in `app/store.py` rather than discovered later.
+
+---
+
 ## 1. Components
 
 ```text
@@ -160,6 +202,15 @@ Short-window counters use bucketed sort keys (`WINDOW#10M#<epoch/600>`) plus Dyn
 ---
 
 ## 4. Authentication
+
+> **Not built.** The running service uses a single shared API key from
+> `FRAUDSHIELD_API_KEY`, checked with `secrets.compare_digest` on every guarded
+> route. If that variable is unset, **all endpoints are open** and the service
+> prints a warning at startup. It binds `127.0.0.1` and should stay there.
+>
+> What the API key does not give you: per-user identity, analyst/admin role
+> separation, rate limiting, or session revocation. The design below is what
+> should replace it.
 
 DynamoDB is the credential store. No Cognito, so that the whole flow is inspectable in a demo.
 

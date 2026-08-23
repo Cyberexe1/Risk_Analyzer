@@ -216,9 +216,22 @@ Full confusion matrices, per-archetype recall, threshold sweep, fairness slices 
 
 ---
 
+## Offline/online parity
+
+Every metric above came from a batch pass over a sorted file. Production gets one transaction and whatever counters earlier traffic left behind. If those disagree, the metrics describe something unshippable — so it's tested:
+
+```text
+tests/test_parity.py         99,419 rows x 22 features = 2,187,218 comparisons  -> agree
+tests/test_score_parity.py   30,000 rows x 4 scores                            -> agree
+```
+
+`app/online_features.py` is an independent reimplementation of the generator's forward pass. Sharing that code would make the test meaningless. The scorer never writes state; `store.commit()` is the caller's job afterwards, so a read-after-write bug shows up instantly as a velocity mismatch.
+
+Caveat: DynamoDB can't hold an exact trailing-600-second deque, so the planned bucketed windows will diverge from these results. That needs its own measurement before it's trusted.
+
 ## Quickstart
 
-The ML pipeline runs end to end today. The FastAPI service and React dashboards are not built yet.
+The ML pipeline and the scoring API run today. The DynamoDB adapter, JWT auth and React dashboards do not.
 
 ```bash
 pip install -r requirements.txt
@@ -226,7 +239,30 @@ pip install -r requirements.txt
 python ml/generate_dataset.py --n 100000   # ~99k rows -> ml/data/
 python ml/train.py                         # -> ml/artifacts/model.json + calibrator
 python ml/evaluate.py                      # -> ml/artifacts/metrics.json
+
+python tests/test_parity.py                # offline/online feature parity
+python tests/test_score_parity.py          # offline/online score parity
 ```
+
+Run the service:
+
+```bash
+set FRAUDSHIELD_API_KEY=devkey
+python -m uvicorn app.main:app --port 8000
+```
+
+Startup replays the **train split only** into the entity store, so device, IP and velocity counters are warm — warming from validation or test would leak the evaluation period into serving state. Docs at http://localhost:8000/docs.
+
+A card-testing burst against one device, nine attempts 35 seconds apart:
+
+```text
+ 1  failed  score 51.6  MANUAL_REVIEW  ml  72.2  rules  5.0  net 0.0
+ 2  failed  score 71.0  BLOCK          ml 100.0  rules  5.0  net 0.0
+ ...
+ 7  failed  score 75.0  BLOCK          ml 100.0  rules 25.0  net 0.0
+```
+
+The rule layer only joins at attempt 7, when `velocity_breach` crosses 5-in-10-minutes. The model had it at attempt 2. Same transaction through `/v1/checkout` returns `{"status":"declined","message":"We couldn't process this payment..."}` — no score, no sub-score, no reason code. Telling an attacker which signal fired is free reconnaissance.
 
 Roughly two minutes total on a laptop. The generator prints its own difficulty report — per-feature AUC and how much fraud no simple rule catches — and warns if any single feature separates the classes too well. `evaluate.py` prints the full threshold sweep, baseline comparison, cost breakdown, fairness slices and one worked SHAP explanation.
 
@@ -272,14 +308,14 @@ npm run dev
 
 ```text
 fraudshield/
-+-- app/                      FastAPI service
-|   +-- main.py
-|   +-- api/                  routers: auth, catalog, orders, risk, admin
-|   +-- core/                 config, JWT, password hashing, dependencies
-|   +-- db/                   DynamoDB client, single-table access layer
-|   +-- features/             feature builders: velocity, baseline, graph
-|   +-- scoring/              ml.py, rules.py, network.py, aggregator.py
-|   +-- schemas/              Pydantic request / response models
++-- app/                      scoring service -- BUILT
+|   +-- main.py               FastAPI: score, checkout, queue, detail, outcome
+|   +-- scorer.py             ML + rules + network + aggregation + reasons
+|   +-- online_features.py    independent reimpl of the 22 features
+|   +-- store.py              entity state; in-memory, DynamoDB adapter unbuilt
++-- tests/
+|   +-- test_parity.py        22 features, offline vs online
+|   +-- test_score_parity.py  4 scores, offline vs online
 +-- ml/                       offline pipeline -- BUILT AND VERIFIED
 |   +-- generate_dataset.py   event simulation + forward feature pass
 |   +-- features.py           shared matrix builder + leakage assertion

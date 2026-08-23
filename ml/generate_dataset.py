@@ -720,6 +720,11 @@ def compute_features(events: list[dict], segments: dict | None = None) -> pd.Dat
                 "customer_id": cid,
                 "timestamp": dt.isoformat(),
                 "ts_epoch": ts,
+                # Emitted so the online scorer can be seeded with the same signup
+                # time the offline pass used. Without it, tests must back-compute
+                # created_at from a rounded age and inherit that rounding error.
+                # NOT a model feature -- see LEAKY_OR_ID in ml/features.py.
+                "account_created_at": created,
                 "device_fp": dev,
                 "ip_hash": ipa,
                 # --- transaction (4)

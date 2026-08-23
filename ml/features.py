@@ -45,9 +45,16 @@ PAYMENT_METHODS = ["upi", "card", "netbanking", "wallet", "cod"]
 #   ts_epoch       -- absolute time. The model would learn "week 8 = test set".
 #   timestamp
 #   transaction_id
+#   account_created_at
+#                  -- absolute signup time. Exists so the online scorer can be
+#                     seeded identically (see tests/test_parity.py). As a feature
+#                     it would leak cohort timing: "accounts created in June" is a
+#                     property of the test split, not of fraud. account_age_hours
+#                     is the relative version, and that one IS a feature.
 LEAKY_OR_ID = {
     "status", "fraud_type", "segment", "customer_id", "device_fp", "ip_hash",
     "ts_epoch", "timestamp", "transaction_id", "fraud_label", "split",
+    "account_created_at",
 }
 
 # Heavy right skew: rupee amounts, ages in hours, and inter-arrival gaps all span

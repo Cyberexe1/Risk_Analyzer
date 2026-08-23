@@ -1,10 +1,20 @@
 # Versions verified against this codebase on Python 3.13 / Windows.
+
+# ML pipeline
 numpy==2.2.1
 pandas==2.3.1
 scikit-learn==1.7.1
 xgboost==3.0.3
 
-# NOTE: the `shap` package is deliberately NOT a dependency. evaluate.py gets
-# exact per-row attributions from XGBoost's native `pred_contribs=True`, which is
-# TreeSHAP computed inside the booster -- same values, no extra dependency, and
-# no sampling approximation.
+# API
+fastapi==0.115.6
+uvicorn==0.49.0
+pydantic==2.13.4
+
+# NOTE: the `shap` package is deliberately NOT a dependency. evaluate.py and the
+# online scorer get exact per-row attributions from XGBoost's native
+# `pred_contribs=True`, which is TreeSHAP computed inside the booster -- same
+# values, no extra dependency, no sampling approximation.
+#
+# boto3 is not listed because the DynamoDB adapter is not built. The store is
+# in-memory (app/store.py) and does not survive a restart.
