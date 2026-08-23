@@ -1,5 +1,10 @@
-numpy==2.1.3
-pandas==2.2.3
-xgboost==2.1.3
-scikit-learn==1.5.2
-shap==0.46.0
+# Versions verified against this codebase on Python 3.13 / Windows.
+numpy==2.2.1
+pandas==2.3.1
+scikit-learn==1.7.1
+xgboost==3.0.3
+
+# NOTE: the `shap` package is deliberately NOT a dependency. evaluate.py gets
+# exact per-row attributions from XGBoost's native `pred_contribs=True`, which is
+# TreeSHAP computed inside the booster -- same values, no extra dependency, and
+# no sampling approximation.

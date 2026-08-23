@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-22T15:14:09.258966+00:00",
+  "generated_at": "2026-08-23T05:41:34.834935+00:00",
   "seed": 20260822,
   "config": {
     "n_transactions": 100000,
@@ -8,42 +8,42 @@
     "end_date": "2026-06-30"
   },
   "transactions": {
-    "rows": 99373,
-    "customers": 4706,
-    "devices": 4710,
-    "ips": 4363,
-    "fraud_rate_actual": 0.02029,
+    "rows": 99419,
+    "customers": 4703,
+    "devices": 12480,
+    "ips": 4421,
+    "fraud_rate_actual": 0.02014,
     "split_boundaries": {
-      "train_end": "2026-05-10T19:53:39.428457+00:00",
-      "validation_end": "2026-06-05T10:50:04.229593+00:00",
-      "test_end": "2026-06-30T01:26:55.064896+00:00"
+      "train_end": "2026-05-11T04:30:56.872943+00:00",
+      "validation_end": "2026-06-05T14:03:39.209009+00:00",
+      "test_end": "2026-06-29T23:52:50.126019+00:00"
     },
     "single_feature_auc_top8": {
-      "device_failure_rate": 0.8173,
-      "seconds_since_last_txn": 0.7948,
-      "account_age_hours": 0.7598,
-      "amount_ratio": 0.7223,
-      "device_txn_count": 0.7138,
-      "historical_failure_rate": 0.7031,
-      "txn_count_1h": 0.6983,
-      "txn_count_10m": 0.6742
+      "device_failure_rate": 0.7672,
+      "amount_ratio": 0.7303,
+      "seconds_since_last_txn": 0.7121,
+      "account_age_hours": 0.6998,
+      "txn_count_1h": 0.6948,
+      "historical_failure_rate": 0.6833,
+      "txn_count_10m": 0.6739,
+      "failed_count_1h": 0.6592
     },
     "warnings": [],
-    "fraud_indistinguishable_by_simple_rules": 0.3333,
+    "fraud_indistinguishable_by_simple_rules": 0.3551,
     "fraud_rate_by_split": {
-      "test": 0.02375,
-      "train": 0.01732,
-      "validation": 0.03066
+      "test": 0.02293,
+      "train": 0.01868,
+      "validation": 0.02414
     },
     "rows_by_split": {
-      "train": 69561,
-      "validation": 14906,
-      "test": 14906
+      "train": 69593,
+      "validation": 14913,
+      "test": 14913
     },
     "fraud_type_counts": {
-      "card_testing": 605,
-      "account_takeover": 481,
-      "ring_cashout": 430,
+      "card_testing": 601,
+      "account_takeover": 480,
+      "ring_cashout": 421,
       "refund_abuse": 260,
       "first_party_abuse": 240
     }

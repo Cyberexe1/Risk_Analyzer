@@ -1,0 +1,47 @@
+{
+  "rows": {
+    "train": 69593,
+    "validation": 14913,
+    "test": 14913
+  },
+  "fraud_rate": {
+    "train": 0.01868,
+    "validation": 0.02414,
+    "test": 0.02293
+  },
+  "validation_metrics": {
+    "pr_auc": 0.8742,
+    "roc_auc": 0.9697,
+    "brier_raw": 0.02693,
+    "brier_calibrated": 0.00546
+  },
+  "importance_gain": {
+    "failed_count_1h": 2231.04,
+    "failed_count_10m": 915.81,
+    "device_account_count": 804.36,
+    "account_age_hours": 697.81,
+    "amount_ratio": 479.8,
+    "historical_failure_rate": 292.75,
+    "method_upi": 290.29,
+    "is_new_device": 284.56,
+    "amount": 226.72,
+    "hour_deviation": 222.01,
+    "ip_account_count": 197.7,
+    "seconds_since_last_txn": 194.27,
+    "prev_txn_count": 180.11,
+    "method_card": 139.35,
+    "customer_avg_amount": 138.55,
+    "ip_txn_count": 130.31,
+    "device_failure_rate": 124.25,
+    "method_wallet": 117.51,
+    "device_txn_count": 106.9,
+    "txn_count_1h": 97.86,
+    "hour_cos": 97.52,
+    "method_cod": 94.07,
+    "txn_count_10m": 91.73,
+    "hour_sin": 91.48,
+    "method_netbanking": 89.07,
+    "is_new_payment_method": 79.74,
+    "is_weekend": 72.57
+  }
+}

@@ -124,18 +124,24 @@ ml_score = round(calibrator(model.predict_proba(x)[1]) * 100)
 
 ### Learned importance vs. our guesses
 
-Top features by mean absolute SHAP on the test set, against the MVP's hand-picked ranking:
+Measured importance by gain (`ml/artifacts/train_report.json`), against the MVP's hand-picked ranking:
 
-| Feature | Learned rank | MVP rank | Comment |
-| --- | --- | --- | --- |
-| `amount_ratio` | 1 | 3 | Baseline-relative amount beats raw velocity |
-| `txn_count_10m` | 2 | 1 | Strong, but not the top signal |
-| `device_account_count` | 3 | 2 | Roughly as expected |
-| `account_age_hours` | 4 | 5 | Materially more predictive than we assumed |
-| `failed_count_10m` | 5 | — | Not in the MVP at all; highly predictive |
-| `hour_deviation` | 14 | 4 | We badly over-weighted time-of-day |
+| Feature | Gain | Learned rank | MVP rank | Comment |
+| --- | --- | --- | --- | --- |
+| `failed_count_1h` | 2231.0 | 1 | — | **Not in the MVP at all, and it dominates** |
+| `failed_count_10m` | 915.8 | 2 | — | Also absent from the MVP |
+| `device_account_count` | 804.4 | 3 | 2 | Roughly as expected |
+| `account_age_hours` | 697.8 | 4 | 5 | Materially more predictive than assumed |
+| `amount_ratio` | 479.8 | 5 | 3 | Useful, but nowhere near the top |
+| `historical_failure_rate` | 292.8 | 6 | — | Third failure-related feature in the top six |
+| `is_new_device` | 284.6 | 8 | 4 | |
+| `hour_deviation` | 222.0 | 10 | 4 | Time-of-day was badly over-weighted |
 
-The MVP would have paid too much attention to the clock and too little to failure bursts. That gap is the concrete argument for learning weights rather than choosing them.
+The single most predictive feature carries **4.6x the gain of `amount_ratio`** and was not in the MVP's feature set at all. Three of the top six are failure-velocity features, none of which the hand-picked formula measured separately — it folded failures into general velocity.
+
+Note this also corrects an earlier claim in this document, which asserted `amount_ratio` would rank first. It ranks fifth. The measurement wins.
+
+That gap is the concrete argument for learning weights rather than choosing them: the MVP would have spent its budget on the clock and the amount while ignoring the signal that actually separates the classes.
 
 ---
 
@@ -311,17 +317,21 @@ Not `82 + 76 + 91 = 249`, and not `82 + 10 + 8 + 7 = 107`. A weighted mean of th
 
 ### Weight selection
 
-The 0.70 / 0.20 / 0.10 split is itself a choice, so we grid-searched it on the validation fold against net rupee cost:
+The 0.70 / 0.20 / 0.10 split is itself a choice, so it was grid-searched on the validation fold. Measured:
 
-| ML | Rules | Network | Val PR-AUC | Net cost (Rs) |
+| ML | Rules | Network | Val PR-AUC | Best cost (Rs) |
 | --- | --- | --- | --- | --- |
-| 1.00 | 0.00 | 0.00 | 0.81 | 1,42,000 |
-| 0.80 | 0.15 | 0.05 | 0.82 | 1,31,000 |
-| **0.70** | **0.20** | **0.10** | **0.83** | **1,24,000** |
-| 0.60 | 0.25 | 0.15 | 0.82 | 1,29,000 |
-| 0.50 | 0.30 | 0.20 | 0.79 | 1,47,000 |
+| 1.00 | 0.00 | 0.00 | **0.8685** | 1,88,890 |
+| 0.80 | 0.15 | 0.05 | 0.8653 | **1,87,475** |
+| **0.70** | **0.20** | **0.10** | 0.8607 | 1,88,273 |
+| 0.60 | 0.25 | 0.15 | 0.8541 | 2,14,133 |
+| 0.50 | 0.30 | 0.20 | 0.8391 | 2,15,813 |
 
-Differences are small, which is the honest reading: the aggregation weights matter far less than the features and the decision thresholds. We report the search rather than presenting 0.70 as revealed truth.
+The honest reading, which is not the one this document originally gave: **PR-AUC falls monotonically as rule and network weight rises.** Pure ML ranks best. The lowest *cost* is at 0.80/0.15/0.05, and 0.70/0.20/0.10 is third on both measures.
+
+We keep 0.70/0.20/0.10 anyway, and the reason is not accuracy. Every point of rule weight buys an auditable, human-readable justification that survives a compliance review and works on day zero for a merchant with no labels. The measured price of that is about **0.008 PR-AUC and Rs 800 of validation cost** against the best alternative. That is a defensible trade to state out loud; presenting 0.70 as the accuracy optimum would not be.
+
+Differences across the whole grid are small. Aggregation weights matter far less than the features and the decision thresholds.
 
 ### Override paths
 

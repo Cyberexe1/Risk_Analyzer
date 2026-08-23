@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Generated data. Reproducible with:
+#   python ml/generate_dataset.py --n 100000
+# Deterministic given the fixed seed, so there is no reason to version a 20 MB CSV.
+ml/data/*.csv
+
+# Trained artifacts are kept in git on purpose: metrics.json is the source of
+# truth the docs are checked against, and model.json is small.
+!ml/artifacts/
+
+.env
+.DS_Store

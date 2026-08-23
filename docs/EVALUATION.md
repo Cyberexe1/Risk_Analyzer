@@ -130,102 +130,104 @@ Validation is for early stopping, isotonic calibration, the aggregation weight s
 
 ## 3. Results on the held-out test set
 
-> **Projected, not measured.** No model has been trained yet. The figures below
-> define the reporting format and the cost arithmetic; they were written against a
-> 7,500-row test week and have not been rescaled to the 14,906-row test split now
-> in `ml/data/`. Replace all of section 3 with `evaluate.py` output before showing
-> this to anyone.
+Measured. `python ml/train.py && python ml/evaluate.py`, output in `ml/artifacts/metrics.json`.
+
+Model: XGBoost, 27 columns from the 22 raw features (one-hot payment method, sin/cos hour), early stopped at iteration 174 of 400, `scale_pos_weight = 52.5`.
 
 ### Ranking quality (threshold-free)
 
-| Metric | Value |
-| --- | --- |
-| PR-AUC | **0.83** |
-| ROC-AUC | 0.971 |
-| Brier score (calibrated) | 0.0119 |
+| Metric | Validation | Test |
+| --- | --- | --- |
+| PR-AUC | 0.8742 | **0.7875** |
+| ROC-AUC | 0.9697 | 0.9399 |
+| Brier (calibrated ML) | 0.00546 | 0.00709 |
+| Brier (raw, uncalibrated) | 0.02693 | — |
 
-PR-AUC is the headline. ROC-AUC of 0.971 sounds better than it is: with 1.74% positives, ROC-AUC is dominated by the vast negative class and stays high even for mediocre models. We report both and lead with the one that is hard to game.
+Test PR-AUC is **0.087 below validation**. That gap is what a temporal split is for: it is the cost of scoring a period the model never saw, and a random split would have hidden it.
 
-### Confusion matrix at the review threshold (score >= 40)
+Isotonic calibration cuts the Brier score by 5x (0.0269 → 0.0055). That matters because the cost model multiplies probability by rupees — uncalibrated margins would make the entire cost section arithmetic nonsense.
 
-7,500 test transactions, 143 fraud.
+ROC-AUC 0.9399 looks better than the model is. With 2.29% positives, ROC-AUC is dominated by the 14,571 easy negatives. PR-AUC is the number to read.
 
-```text
-                    predicted
-                REVIEW+   ALLOW
-actual  fraud      116       27      recall    0.811
-        legit      141     7,216     FP rate   0.0192
-                  -----   -----
-                   257     7,243     precision 0.451
-```
+### Chosen operating point
 
-Precision at the review gate is **0.451** — of 257 flagged transactions, 116 were fraud. Slightly under half. That is the honest number for a queue-level threshold, and it is fine, because a review is a two-minute analyst look and not a decline.
-
-### The precision figure quoted in the README
-
-The README's 0.74 precision is at the **block** threshold (score >= 75), which is where precision actually matters because there is no human in the loop:
+Thresholds selected on validation by expected-cost minimisation, then frozen: **review >= 5, block >= 70**. Test split: 14,913 transactions, 342 fraud (2.29%).
 
 ```text
-                    predicted
-                 BLOCK    not
-actual  fraud       31      112      recall    0.217
-        legit       11    7,346      FP rate   0.0015
-                  -----   -----
-                    42     7,458     precision 0.738
+                  BLOCK   REVIEW    ALLOW
+  fraud            189       81       72
+  legitimate         0      459   14,112
 ```
-
-Two thresholds, two very different operating points:
 
 | Gate | Precision | Recall | FP rate | Volume |
 | --- | --- | --- | --- | --- |
-| Review (>= 40) | 0.451 | 0.811 | 1.92% | 3.4% of traffic |
-| Block (>= 75) | 0.738 | 0.217 | 0.15% | 0.56% of traffic |
+| Review (>= 5) | **0.370** | **0.789** | 3.15% | 4.89% of traffic |
+| Block (>= 70) | **1.000** | 0.553 | 0.00% | 1.27% of traffic |
 
-Quoting only the block precision would be misleading, so both are here. The README now points at this table.
+### Block precision of 1.000 is a warning, not an achievement
+
+189 blocks, zero false positives. **No real detector does this.** It is evidence that the synthetic generator's high-confidence fraud is too cleanly separable, not evidence that the model is excellent.
+
+Card testing (recall 1.000) and ring cashout (recall 1.000) are the culprits: both are generated as tight behavioural bursts, and the failure-velocity features pick them off perfectly. Real card testing is throttled, distributed across devices, and mixed into normal traffic.
+
+Treat every figure in the block row as an upper bound that will not survive contact with production traffic.
 
 ### Per-archetype recall (review gate)
 
-| Archetype | Recall | Note |
-| --- | --- | --- |
-| Card testing | 0.94 | Velocity and failure features make this easy |
-| Ring / bulk cashout | 0.88 | Network layer earns its keep — but see generator caveat |
-| Account takeover | 0.79 | New device plus amount ratio |
-| Refund abuse | 0.61 | Weak at transaction time; needs post-purchase behaviour |
-| First-party abuse | 0.42 | **The genuine weakness.** Indistinguishable at checkout |
+| Archetype | n | Recall | Reading |
+| --- | --- | --- | --- |
+| Card testing | 74 | 1.000 | Too easy — see above |
+| Ring cashout | 26 | 1.000 | Too easy, and partly measuring the generator |
+| Account takeover | 147 | 0.986 | Amount ratio + new device is a strong combination |
+| Refund abuse | 55 | **0.455** | Weak signal at payment time, as expected |
+| First-party abuse | 40 | **0.000** | Undetectable by construction |
 
-First-party abuse at 0.42 is the number to look at. A real customer making a real purchase and later lying about delivery produces a transaction with no risk signal whatsoever. It is not detectable at scoring time by design, and no amount of feature engineering on the payment fixes it. It needs delivery evidence, claim history and account tenure — which is the chargeback-evidence responder, a different tool.
+First-party abuse at **exactly 0.000** is the honest headline. Those 40 rows are genuinely normal transactions on established accounts, own device, own IP — they were relabelled, not perturbed. A model cannot find them because there is nothing there. This caps achievable recall at 0.883 on this dataset no matter how good the model gets, and it is the single most important number for setting expectations: catching that loss class needs delivery evidence and claim history, which is a different tool.
 
 ### Baselines
 
-| Model | PR-AUC | Precision @ review | Recall @ review |
-| --- | --- | --- | --- |
-| Random | 0.017 | 0.017 | 0.034 |
-| Amount threshold only (> Rs 10,000) | 0.09 | 0.061 | 0.29 |
-| **MVP hand-picked weights (the +25/+20/+18 formula)** | 0.44 | 0.213 | 0.58 |
-| Logistic regression, same 22 features | 0.71 | 0.362 | 0.74 |
-| Rules layer alone | 0.51 | 0.247 | 0.66 |
-| XGBoost alone | 0.81 | 0.437 | 0.80 |
-| **FraudShield (ML + rules + network)** | **0.83** | **0.451** | **0.811** |
+Same test split. Each model gets its own cost-optimal thresholds under the same analyst capacity ceiling, so the comparison is like-for-like.
 
-Two readings worth stating plainly:
+| Model | PR-AUC | Precision | Recall | Cost (Rs) |
+| --- | --- | --- | --- | --- |
+| Random | 0.024 | 0.023 | 0.953 | 553,450 |
+| Amount threshold (> Rs 10,000) | 0.080 | 0.188 | 0.348 | 1,530,782 |
+| Network layer alone | 0.174 | 0.163 | 0.272 | 903,480 |
+| Rules layer alone | 0.342 | 0.489 | 0.517 | 598,420 |
+| **MVP hand-picked formula** | **0.404** | 0.388 | 0.471 | 657,075 |
+| **XGBoost alone** | **0.800** | **0.675** | 0.778 | 277,535 |
+| **FraudShield ensemble** | 0.788 | 0.370 | **0.789** | **274,500** |
 
-- The hand-picked MVP formula reaches PR-AUC 0.44. It is not useless — the signals were well chosen — but learned weights nearly double it.
-- The full ensemble beats XGBoost alone by 0.02 PR-AUC. That is a **small** gain. The rules and network layers justify themselves on auditability, cold start and novel-pattern coverage, not on this delta. Claiming the ensemble is a large accuracy win would be dishonest.
+Three findings, including one that contradicts what this document previously claimed.
+
+**Learned weights roughly double the hand-picked formula.** 0.404 → 0.788 PR-AUC. The MVP's five signals were well chosen; the numbers attached to them were not. This is the clearest justification for the whole ML layer.
+
+**The ensemble is WORSE than XGBoost alone on ranking.** 0.788 vs 0.800 PR-AUC, and precision collapses from 0.675 to 0.370. An earlier version of this document claimed the ensemble won by 0.02. **That was wrong.** The rules and network layers actively degrade ranking quality.
+
+The mechanism is specific and worth understanding. At a review threshold of 5, the rule layer's floor contribution alone clears the gate: a legitimate new customer on a new device fires `new_account` + `new_device` + `amount_anomaly` for 25 rule points, and `0.20 x 25 = 5` crosses the threshold with an ML score of zero. The rule layer drags in hundreds of legitimate rows that the model had correctly ranked near zero. That is where 459 false-positive reviews come from.
+
+**The ensemble is still marginally cheaper** — Rs 274,500 vs Rs 277,535 — because it catches 4 more fraud cases and a missed fraud costs 100x a review. So on cost it wins by 1%, on ranking it loses. Both are true and the honest summary is that the rules and network layers earn their place on **auditability, cold start and novel-pattern coverage**, not on accuracy. If the only goal were PR-AUC, we would ship XGBoost alone.
+
+The obvious fix — requiring a nonzero ML contribution before the rule layer can push a transaction into review — is not implemented. It would improve precision and weaken the cold-start argument, and we would rather report the measured trade-off than quietly tune it away.
 
 ---
 
 ## 3a. Promotion abuse — evaluated separately
 
+> **Still projected, not measured.** `generate_dataset.py` produces
+> `ml/data/promo_redemptions.csv` (5,984 rows, 8.09% abuse), but no scorer or
+> evaluation exists for the redemption gate yet. The numbers below are a target,
+> not a result. Section 3 is measured; this section is not.
+
 Promo abuse is scored at redemption, not at checkout, so it has a different population and a different denominator. Folding it into the transaction metrics above would be wrong. It gets its own numbers.
 
 | Property | Value |
 | --- | --- |
-| Promo redemptions, 8 weeks | 6,410 |
-| Test week (week 8) | 812 redemptions |
-| Abusive redemptions in test | 61 (7.5%) |
+| Promo redemptions generated | 5,984 |
+| Abuse rate | 8.09% |
 | Offer value | Rs 500 |
 
-Note the base rate: **7.5%, against 1.74% for payment fraud**. Promo abuse is far more common than card fraud because it is low-risk and low-effort for the abuser — no stolen credentials needed, just a second email address.
+Note the base rate: **8.09%, against 2.29% for payment fraud in the test split**. Promo abuse is far more common than card fraud because it is low-risk and low-effort for the abuser — no stolen credentials needed, just a second email address.
 
 ### Confusion matrix at the redemption gate
 
@@ -305,50 +307,54 @@ Figures for a mid-size Indian D2C merchant, average order value Rs 2,400.
 
 The dominant asymmetry: a blocked legitimate customer costs **Rs 1,438**, a review costs **Rs 35**. Blocking is roughly 41x more expensive per error than reviewing. That is precisely why the architecture routes most risk to `MANUAL REVIEW` and keeps `BLOCK` narrow and high-precision.
 
-### Cost on the test week
+### Cost on the test split — measured
 
-7,500 transactions, 143 fraud.
+14,913 transactions over ~25 days, 342 fraud.
 
 **Without FraudShield** — everything allowed:
 
 ```text
-143 fraud x Rs 3,550                       = Rs 5,07,650
+342 fraud x Rs 3,550                        = Rs 12,14,100
 ```
 
-**With FraudShield** at the chosen thresholds:
+**With FraudShield** at review >= 5, block >= 70:
 
 ```text
-fraud blocked          31 x Rs     0        = Rs         0
-fraud reviewed+caught  85 x Rs    35        = Rs     2,975
-fraud missed           27 x Rs 3,550        = Rs    95,850
-legit reviewed        130 x Rs    35        = Rs     4,550
-legit blocked          11 x Rs 1,438        = Rs    15,818
-                                              ------------
-total cost                                    Rs   119,193
+fraud blocked         189 x Rs     0         = Rs        0
+fraud reviewed+caught  81 x Rs    35         = Rs    2,835
+fraud missed           72 x Rs 3,550         = Rs  2,55,600
+legit reviewed        459 x Rs    35         = Rs   16,065
+legit blocked           0 x Rs 1,438         = Rs        0
+                                               ------------
+total cost                                     Rs  2,74,500
 ```
 
 ```text
-Loss without system     Rs 5,07,650
-Loss with system        Rs 1,19,193
-Net saving              Rs 3,88,457   (76.5% reduction)
-False-positive cost     Rs   20,368   (17.1% of remaining cost)
+Loss without system     Rs 12,14,100
+Loss with system        Rs  2,74,500
+Net saving              Rs  9,39,600   (77.4% reduction)
+False-positive cost     Rs    16,065   (5.9% of remaining cost)
 ```
 
-**Rs 20,368 of that saving is paid for by legitimate customers** — Rs 4,550 in review friction and Rs 15,818 in wrongly blocked orders. Eleven real customers were declined in one week. That is the cost of running this system, stated in rupees rather than hidden behind a recall figure, and it is why the block gate is deliberately conservative.
+Annualised at this volume: roughly **Rs 1.37 crore** avoided loss against **Rs 2.35 lakh** in false-positive cost.
 
-Annualised at this volume: roughly **Rs 2.0 crore** avoided loss against **Rs 10.6 lakh** in false-positive cost.
+**Zero legitimate customers were blocked.** That is a direct consequence of block-gate precision being 1.000, which as noted above is a property of the synthetic data rather than the model. Do not read it as "FraudShield never declines a real customer." Read it as "on this dataset the top score band happened to be pure, and it will not be in production."
+
+The remaining cost is dominated by a single line: **Rs 2,55,600 of missed fraud, 93% of everything left**. Of the 72 misses, 40 are `first_party_abuse` (undetectable by construction) and 30 are `refund_abuse` (weak payment-time signal). Only 2 misses are from the archetypes this system is actually built to catch. Improving the model further would barely move the number — the leverage is in post-purchase evidence, not better transaction scoring.
+
+False positives cost Rs 16,065, all of it analyst time on 459 reviews. That is genuine friction on real customers, and it buys Rs 9.4 lakh of avoided loss.
 
 ### Cost sensitivity
 
-The churn estimate is the softest input. Halving and doubling it:
+The churn estimate is the softest input. From `cost_model.sensitivity()`:
 
-| Churn cost per wrong block | Block cost | Optimal block threshold | Net saving |
-| --- | --- | --- | --- |
-| Rs 575 (optimistic) | Rs 863 | 68 | Rs 3,91,200 |
-| **Rs 1,150 (used)** | **Rs 1,438** | **75** | **Rs 3,88,457** |
-| Rs 2,300 (pessimistic) | Rs 2,588 | 84 | Rs 3,82,100 |
+| Churn probability | Cost per wrong block | Block : review ratio |
+| --- | --- | --- |
+| 0.10 (optimistic) | Rs 863 | 25x |
+| **0.20 (used)** | **Rs 1,438** | **41x** |
+| 0.40 (pessimistic) | Rs 2,588 | 74x |
 
-Net saving is robust across the range; the *optimal threshold* is not. Merchants with high customer lifetime value should block later and review more. The threshold tuner in the admin dashboard exposes exactly this trade-off with the merchant's own numbers.
+On this test split the sensitivity does not change the outcome, because zero legitimate transactions were blocked — the term it feeds is multiplied by zero. That is a property of this dataset, not a robustness result. On production traffic with a nonzero block-FP count, this input would directly set the optimal block threshold, and merchants with high customer lifetime value should block later and review more.
 
 ---
 
@@ -368,23 +374,49 @@ def expected_cost(review_t, block_t, scores, labels):
     )
 ```
 
-Grid over `review_t` in 20..60 and `block_t` in 60..95, evaluated on validation:
+Grid over `review_t` in 5..75 and `block_t` in 40..100, evaluated on validation. Measured top of the sweep:
 
 | review | block | Val cost (Rs) | Review volume | Legit blocked |
 | --- | --- | --- | --- | --- |
-| 25 | 70 | 1,38,400 | 9.8% | 24 |
-| 30 | 75 | 1,29,100 | 6.1% | 16 |
-| **40** | **75** | **1,24,300** | **3.2%** | **12** |
-| 50 | 80 | 1,27,800 | 1.9% | 7 |
-| 60 | 85 | 1,34,900 | 1.1% | 4 |
+| **5** | **70** | **1,88,273** | **3.83%** | **1** |
+| 5 | 60 | 1,89,046 | 3.70% | 2 |
+| 5 | 65 | 1,89,081 | 3.71% | 2 |
+| 5 | 55 | 1,90,379 | 3.68% | 3 |
+| 10 | 70 | 1,92,863 | 1.31% | 1 |
+| 10 | 60 | 1,93,636 | 1.18% | 2 |
 
-`(40, 75)` wins on the validation fold and was then applied unchanged to test. We did not tune on test.
+`(5, 70)` won on validation and was applied unchanged to test.
 
-Note the shape: cost is flat-bottomed between review 30 and 50. Precision to the decimal point is not what matters — being in the right region is. Claiming 40 is uniquely optimal would overstate what this grid shows.
+### Analyst capacity is the binding constraint, not the model
 
-### Operational capacity check
+This is the most important structural finding in the evaluation, and it is not what we expected going in.
 
-3.2% of traffic at 7,500 transactions/week is ~240 reviews, about 12 analyst-hours. A single analyst covers it. If volume grows 10x, the review threshold must rise or headcount must — the model does not change that arithmetic, and pretending an unbounded queue is free is a common way these projects fail in production.
+A missed fraud costs Rs 3,550. A review costs Rs 35. That is a **100:1 ratio**, so expected-cost minimisation always wants to review more — the optimiser will happily send 30% of traffic to a queue, because on paper each review is nearly free. Left unconstrained, the "optimal" policy is "review everything you can."
+
+Real queues are not unbounded, so `evaluate.py` takes a `--max-review-rate` ceiling (default 4% of traffic) and rejects any operating point above it. The chosen threshold sits exactly against that ceiling at 3.83%.
+
+The consequence: **the review threshold is set by how many analysts the merchant employs, not by the model's score distribution.** A merchant who hires a second analyst should lower the threshold and will catch more fraud. Presenting 5 as a property of the model would be wrong.
+
+### The threshold of 5 is not the middle of the scale
+
+Validation score distribution:
+
+```text
+  0-10    14,475
+ 10-20       134
+ 20-40         6
+ 40-60        36
+ 60-80       215
+ 80-101       47
+```
+
+Calibration against a 2% base rate pushes 97% of traffic below 10, so the scale is extremely bimodal. A threshold of 5 is not "barely suspicious" — it sits inside the dense low band where nearly everything lives, which is why it captures 4.89% of traffic. Reading these thresholds as if the 0–100 scale were uniform would be a mistake.
+
+### Capacity ceiling was breached out of sample
+
+The cap held on validation (3.83%) but the same threshold produced **4.89% review volume on test**, over the 4% ceiling. Score distributions shift between periods, so a threshold tuned to sit exactly against a capacity limit will sometimes exceed it. In production the review threshold needs to be a controller targeting a queue rate, not a constant — otherwise the queue overflows in exactly the weeks when fraud is heaviest.
+
+At 14,913 transactions per 25 days, 4.89% is ~729 reviews, roughly 36 analyst-hours. One analyst covers it.
 
 ---
 
@@ -392,23 +424,26 @@ Note the shape: cost is flat-bottomed between review 30 and 50. Precision to the
 
 Protected attributes are excluded from the feature set, but exclusion alone does not prevent disparate impact — proxies leak.
 
-Review-rate parity across groups the generator assigns but the model never sees:
+Measured slice rates on the test split:
 
-| Slice | Review rate | Ratio vs. baseline |
-| --- | --- | --- |
-| Overall | 3.4% | 1.00 |
-| New customers (< 7 days) | 11.2% | 3.29 |
-| Metro cities | 3.1% | 0.91 |
-| Non-metro | 3.9% | 1.15 |
-| UPI-primary users | 2.8% | 0.82 |
-| COD-primary users | 5.1% | 1.50 |
+| Slice | n | Review rate | Block rate | Ratio vs. overall |
+| --- | --- | --- | --- | --- |
+| Overall | 14,913 | 4.89% | 1.27% | 1.00 |
+| **New customers (< 7 days)** | 193 | **46.63%** | **24.35%** | **9.54** |
+| Established (> 1 year) | 9,811 | 4.01% | 0.80% | 0.82 |
+| High-value (top amount decile) | 1,492 | 18.50% | 6.03% | 3.78 |
+| COD-primary | 1,796 | 3.79% | 0.06% | 0.77 |
+| UPI-primary | 6,568 | 3.14% | 0.15% | 0.64 |
 
-Two disparities to be honest about:
+Two corrections to what this document previously claimed, and one serious finding.
 
-- **New customers are reviewed 3.3x more.** This is intentional and defensible: account age is genuinely predictive and the correlation is behavioural, not demographic. The mitigation is the trusted-floor rule, which stops the penalty persisting once a customer has history.
-- **COD-primary users are reviewed 1.5x more.** COD skews non-metro and lower-income in Indian e-commerce, so this is a proxy path worth watching. Part of it is real — COD genuinely carries different abuse patterns — but a 1.5x gap on a payment method that correlates with income deserves ongoing monitoring rather than a shrug. It is logged in the metrics dashboard as a standing slice.
+**New customers are hit far harder than we estimated: 9.5x, not 3.3x.** Nearly half of all transactions from accounts under a week old go to review, and **24% are blocked outright**. Account age is genuinely predictive and the correlation is behavioural rather than demographic, so the direction is defensible — but a quarter of new-customer transactions being declined is an acquisition problem, not just a risk setting. A merchant running paid acquisition would see this as wasted spend. The trusted-floor rule only helps *after* a customer builds history, so it does nothing here. Caveat: n=193, so the confidence interval is wide, and the generator deliberately concentrates fraud in new accounts (card-testing and ring accounts are all fresh), which inflates this beyond what production would show.
 
-No slice is auto-blocked at a materially different rate (block rates sit within 0.11%–0.19% across all slices).
+**COD is reviewed *less*, not more: ratio 0.77.** The earlier claim of 1.50x and the accompanying concern about an income proxy were wrong in direction. COD sits below the overall rate, and its block rate of 0.06% is the lowest of any slice. The proxy concern does not hold on this data.
+
+**High-value transactions are reviewed 3.8x more.** Expected — `amount_ratio` is a top-five feature — but worth watching, because the customers making large purchases are the ones a merchant can least afford to annoy. A 6% block rate on the top amount decile deserves a second look before this ships.
+
+No protected attribute is a model input. Name, gender, city, pin code and age are excluded, and the slices above are computed from behavioural columns only.
 
 ---
 
@@ -418,7 +453,11 @@ Where this system breaks, stated up front rather than discovered by a judge.
 
 | Failure | Impact | Current mitigation |
 | --- | --- | --- |
-| First-party / friendly fraud | Recall 0.42 | Out of scope at checkout; needs post-delivery evidence |
+| First-party / friendly fraud | **Recall 0.000** | None. Out of scope at checkout; needs post-delivery evidence |
+| Rule layer drags legit rows into review | Precision 0.370 vs 0.675 for ML alone | Not fixed. Reported rather than tuned away |
+| Review threshold set by analyst headcount | Threshold is an ops parameter, not a model property | `--max-review-rate` ceiling makes it explicit |
+| Capacity ceiling breached out of sample | 3.83% val -> 4.89% test | Needs a queue-rate controller, not a fixed threshold |
+| New customers blocked at 24% | Acquisition cost | Unresolved; trusted floor only helps established accounts |
 | Adaptive adversary staying under thresholds | Recall degrades over time | Rules are config; ML retrains weekly on new labels |
 | Shared IP (carrier CGNAT, campus, office) | Ring false positives | `shared_ip_penalty` damps high-population IPs |
 | Legitimate shared devices (family tablet) | Device-count false positives | Failure rate and volume features let the model separate them |
@@ -433,19 +472,24 @@ Where this system breaks, stated up front rather than discovered by a judge.
 
 What we can defend:
 
-- Feature engineering and the temporal split are sound; no leakage we are aware of
-- The cost model is explicit, its inputs are stated, and it is sensitivity-tested
-- Both operating points are reported, including the unflattering queue precision of 0.451
-- Learned weights beat the hand-picked MVP formula by a wide margin, and we show the comparison
-- False-positive cost is quantified in rupees and named as a cost borne by real customers
+- No leakage. Features are built in a chronological forward pass; the split is temporal; `status` (the authorisation outcome) is explicitly blocked from the matrix and `assert_no_leakage` fails the run if it slips in.
+- Learned weights roughly double the hand-picked formula: PR-AUC 0.404 → 0.788, measured on the same test split.
+- Calibration is real and does work: Brier 0.0269 → 0.0055, which is what makes the rupee cost model meaningful.
+- The cost model is explicit, its inputs are named, and the soft one is sensitivity-tested.
+- Both operating points are reported, including the unflattering review precision of 0.370.
+- The generator self-reports difficulty and every one of the eight rules fires on genuine customers.
 
 What we cannot:
 
+- **The ensemble is worse than XGBoost alone on ranking** (0.788 vs 0.800 PR-AUC, precision 0.370 vs 0.675). An earlier version of this document claimed the opposite. The extra layers earn their place on auditability and cold start, not accuracy.
+- **Block precision of 1.000 is not credible.** Zero false positives on 189 blocks means the synthetic data's high-confidence fraud is too separable. Same for card-testing and ring recall of exactly 1.000.
+- **First-party abuse recall is 0.000**, and it plus refund abuse account for 70 of the 72 missed frauds. 93% of the remaining cost is missed fraud the transaction scorer structurally cannot see.
+- The review threshold is set by analyst capacity, not by the model. Different headcount, different threshold, different metrics.
+- The new-customer slice is reviewed 9.5x more and blocked at 24%. Partly a real signal, partly the generator concentrating fraud in fresh accounts. n=193.
+- Ring detection is partly evaluated against its own generator's assumptions.
+- The promo gate (section 3a) has a dataset but no implementation and no measurement.
+- Unit costs are industry-typical estimates, not a real merchant's audited figures.
 - Every number is on synthetic data we generated ourselves. Production performance will be worse.
-- The ensemble beats plain XGBoost by only 0.02 PR-AUC. The extra layers are justified by auditability and cold start, not accuracy.
-- Ring detection is partly evaluated against its own generator's assumptions. Treat the 0.88 ring recall as the least trustworthy figure here.
-- First-party abuse, one of the merchant's largest real losses, is largely undetected at scoring time.
-- Unit costs are industry-typical estimates, not this merchant's audited figures.
 
 ---
 

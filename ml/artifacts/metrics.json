@@ -1,0 +1,462 @@
+{
+  "generated_at": "2026-08-23T05:42:29.977814+00:00",
+  "data_file": "ml\\data\\transactions.csv",
+  "model": {
+    "best_iteration": 174,
+    "n_features": 27
+  },
+  "test_rows": 14913,
+  "test_fraud": 342,
+  "test_fraud_rate": 0.02293,
+  "ranking": {
+    "pr_auc": 0.7875,
+    "roc_auc": 0.9399,
+    "brier_calibrated": 0.00709
+  },
+  "thresholds": {
+    "review": 5,
+    "block": 70,
+    "selected_on": "validation",
+    "method": "expected cost minimisation"
+  },
+  "review_gate": {
+    "threshold": 5.0,
+    "precision": 0.3704,
+    "recall": 0.7895,
+    "fp_rate": 0.0315,
+    "volume_share": 0.04888,
+    "tp": 270,
+    "fp": 459,
+    "fn": 72,
+    "tn": 14112
+  },
+  "block_gate": {
+    "threshold": 70.0,
+    "precision": 1.0,
+    "recall": 0.5526,
+    "fp_rate": 0.0,
+    "volume_share": 0.01267,
+    "tp": 189,
+    "fp": 0,
+    "fn": 153,
+    "tn": 14571
+  },
+  "confusion": {
+    "tp_block": 189,
+    "fp_block": 0,
+    "tp_review": 81,
+    "fp_review": 459,
+    "fn": 72,
+    "tn": 14112
+  },
+  "recall_by_archetype": {
+    "account_takeover": 0.9864,
+    "card_testing": 1.0,
+    "first_party_abuse": 0.0,
+    "refund_abuse": 0.4545,
+    "ring_cashout": 1.0
+  },
+  "baselines": {
+    "random": {
+      "pr_auc": 0.0238,
+      "review_gate": {
+        "threshold": 5.0,
+        "precision": 0.023,
+        "recall": 0.9532,
+        "fp_rate": 0.95148,
+        "volume_share": 0.95152,
+        "tp": 326,
+        "fp": 13864,
+        "fn": 16,
+        "tn": 707
+      },
+      "thresholds": [
+        5,
+        100
+      ],
+      "cost": 553450.0
+    },
+    "amount_threshold_10k": {
+      "pr_auc": 0.0804,
+      "review_gate": {
+        "threshold": 15.0,
+        "precision": 0.188,
+        "recall": 0.348,
+        "fp_rate": 0.03528,
+        "volume_share": 0.04245,
+        "tp": 119,
+        "fp": 514,
+        "fn": 223,
+        "tn": 14057
+      },
+      "thresholds": [
+        15,
+        40
+      ],
+      "cost": 1530782.0
+    },
+    "mvp_hand_picked_formula": {
+      "pr_auc": 0.4041,
+      "review_gate": {
+        "threshold": 20.0,
+        "precision": 0.388,
+        "recall": 0.4708,
+        "fp_rate": 0.01743,
+        "volume_share": 0.02783,
+        "tp": 161,
+        "fp": 254,
+        "fn": 181,
+        "tn": 14317
+      },
+      "thresholds": [
+        20,
+        50
+      ],
+      "cost": 657075.0
+    },
+    "rules_only": {
+      "pr_auc": 0.3419,
+      "review_gate": {
+        "threshold": 15.0,
+        "precision": 0.489,
+        "recall": 0.5175,
+        "fp_rate": 0.0127,
+        "volume_share": 0.02427,
+        "tp": 177,
+        "fp": 185,
+        "fn": 165,
+        "tn": 14386
+      },
+      "thresholds": [
+        15,
+        40
+      ],
+      "cost": 598420.0
+    },
+    "network_only": {
+      "pr_auc": 0.1743,
+      "review_gate": {
+        "threshold": 40.0,
+        "precision": 0.1632,
+        "recall": 0.2719,
+        "fp_rate": 0.03274,
+        "volume_share": 0.03822,
+        "tp": 93,
+        "fp": 477,
+        "fn": 249,
+        "tn": 14094
+      },
+      "thresholds": [
+        40,
+        60
+      ],
+      "cost": 903480.0
+    },
+    "xgboost_only": {
+      "pr_auc": 0.8001,
+      "review_gate": {
+        "threshold": 5.0,
+        "precision": 0.6751,
+        "recall": 0.7778,
+        "fp_rate": 0.00878,
+        "volume_share": 0.02642,
+        "tp": 266,
+        "fp": 128,
+        "fn": 76,
+        "tn": 14443
+      },
+      "thresholds": [
+        5,
+        95
+      ],
+      "cost": 277535.0
+    },
+    "fraudshield_ensemble": {
+      "pr_auc": 0.7875,
+      "review_gate": {
+        "threshold": 5.0,
+        "precision": 0.3704,
+        "recall": 0.7895,
+        "fp_rate": 0.0315,
+        "volume_share": 0.04888,
+        "tp": 270,
+        "fp": 459,
+        "fn": 72,
+        "tn": 14112
+      },
+      "thresholds": [
+        5,
+        70
+      ],
+      "cost": 274500.0
+    }
+  },
+  "aggregation_weight_search": [
+    {
+      "weights": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "pr_auc": 0.8685,
+      "best_cost": 188890.0,
+      "at": [
+        5,
+        95
+      ]
+    },
+    {
+      "weights": [
+        0.8,
+        0.15,
+        0.05
+      ],
+      "pr_auc": 0.8653,
+      "best_cost": 187475.0,
+      "at": [
+        5,
+        80
+      ]
+    },
+    {
+      "weights": [
+        0.7,
+        0.2,
+        0.1
+      ],
+      "pr_auc": 0.8607,
+      "best_cost": 188273.0,
+      "at": [
+        5,
+        70
+      ]
+    },
+    {
+      "weights": [
+        0.6,
+        0.25,
+        0.15
+      ],
+      "pr_auc": 0.8541,
+      "best_cost": 214133.0,
+      "at": [
+        10,
+        60
+      ]
+    },
+    {
+      "weights": [
+        0.5,
+        0.3,
+        0.2
+      ],
+      "pr_auc": 0.8391,
+      "best_cost": 215813.0,
+      "at": [
+        10,
+        50
+      ]
+    }
+  ],
+  "threshold_sweep_top10": [
+    {
+      "review": 5,
+      "block": 70,
+      "cost": 188273.0,
+      "review_volume": 0.03829,
+      "legit_blocked": 1,
+      "within_capacity": true
+    },
+    {
+      "review": 5,
+      "block": 60,
+      "cost": 189046.0,
+      "review_volume": 0.03701,
+      "legit_blocked": 2,
+      "within_capacity": true
+    },
+    {
+      "review": 5,
+      "block": 65,
+      "cost": 189081.0,
+      "review_volume": 0.03708,
+      "legit_blocked": 2,
+      "within_capacity": true
+    },
+    {
+      "review": 5,
+      "block": 55,
+      "cost": 190379.0,
+      "review_volume": 0.03681,
+      "legit_blocked": 3,
+      "within_capacity": true
+    },
+    {
+      "review": 5,
+      "block": 75,
+      "cost": 192120.0,
+      "review_volume": 0.04841,
+      "legit_blocked": 0,
+      "within_capacity": false
+    },
+    {
+      "review": 10,
+      "block": 70,
+      "cost": 192863.0,
+      "review_volume": 0.01308,
+      "legit_blocked": 1,
+      "within_capacity": true
+    },
+    {
+      "review": 10,
+      "block": 60,
+      "cost": 193636.0,
+      "review_volume": 0.0118,
+      "legit_blocked": 2,
+      "within_capacity": true
+    },
+    {
+      "review": 10,
+      "block": 65,
+      "cost": 193671.0,
+      "review_volume": 0.01187,
+      "legit_blocked": 2,
+      "within_capacity": true
+    },
+    {
+      "review": 5,
+      "block": 80,
+      "cost": 193695.0,
+      "review_volume": 0.05143,
+      "legit_blocked": 0,
+      "within_capacity": false
+    },
+    {
+      "review": 10,
+      "block": 55,
+      "cost": 194969.0,
+      "review_volume": 0.0116,
+      "legit_blocked": 3,
+      "within_capacity": true
+    }
+  ],
+  "cost": {
+    "unit_costs": {
+      "fraud_loss": 3550.0,
+      "review_cost": 35.0,
+      "block_legit_cost": 1438.0,
+      "fraud_blocked_cost": 0.0,
+      "promo_value": 500.0,
+      "promo_wrong_deny_cost": 760.0,
+      "promo_review_cost": 35.0,
+      "block_to_review_ratio": 41.1
+    },
+    "do_nothing": 1214100.0,
+    "with_fraudshield": 274500.0,
+    "net_saving": 939600.0,
+    "net_saving_pct": 0.7739,
+    "false_positive_cost": 16065.0,
+    "false_positive_share_of_remaining": 0.0585,
+    "legit_blocked": 0,
+    "sensitivity": {
+      "optimistic": {
+        "churn_prob": 0.1,
+        "block_legit_cost": 863.0,
+        "block_to_review_ratio": 24.7
+      },
+      "used": {
+        "churn_prob": 0.2,
+        "block_legit_cost": 1438.0,
+        "block_to_review_ratio": 41.1
+      },
+      "pessimistic": {
+        "churn_prob": 0.4,
+        "block_legit_cost": 2588.0,
+        "block_to_review_ratio": 73.9
+      }
+    }
+  },
+  "fairness": {
+    "overall": {
+      "n": 14913,
+      "review_rate": 0.0489,
+      "block_rate": 0.0127,
+      "ratio_vs_overall": 1.0
+    },
+    "new_customers_under_7d": {
+      "n": 193,
+      "review_rate": 0.4663,
+      "block_rate": 0.2435,
+      "ratio_vs_overall": 9.539
+    },
+    "established_over_1y": {
+      "n": 9811,
+      "review_rate": 0.0401,
+      "block_rate": 0.008,
+      "ratio_vs_overall": 0.819
+    },
+    "cod_primary": {
+      "n": 1796,
+      "review_rate": 0.0379,
+      "block_rate": 0.0006,
+      "ratio_vs_overall": 0.775
+    },
+    "upi_primary": {
+      "n": 6568,
+      "review_rate": 0.0314,
+      "block_rate": 0.0015,
+      "ratio_vs_overall": 0.642
+    },
+    "high_value_top_decile": {
+      "n": 1492,
+      "review_rate": 0.185,
+      "block_rate": 0.0603,
+      "ratio_vs_overall": 3.784
+    }
+  },
+  "worked_example": {
+    "transaction_id": "TX_0093891",
+    "amount": 222.29,
+    "risk_score": 81.0,
+    "sub_scores": {
+      "ml": 100.0,
+      "rules": 25.0,
+      "network": 60.4
+    },
+    "fired_rules": [
+      "velocity_breach",
+      "failure_spike",
+      "new_account"
+    ],
+    "top_shap": [
+      {
+        "feature": "account_age_hours",
+        "contribution": 2.4231
+      },
+      {
+        "feature": "txn_count_1h",
+        "contribution": 0.9147
+      },
+      {
+        "feature": "failed_count_1h",
+        "contribution": 0.6863
+      },
+      {
+        "feature": "historical_failure_rate",
+        "contribution": 0.6709
+      },
+      {
+        "feature": "customer_avg_amount",
+        "contribution": 0.4896
+      }
+    ],
+    "true_label": 1,
+    "fraud_type": "card_testing"
+  },
+  "caveats": [
+    "Synthetic data generated by ml/generate_dataset.py. Production performance will be worse.",
+    "first_party_abuse is undetectable at payment time by construction and caps achievable recall.",
+    "Ring detection is partly evaluated against its own generator's assumptions -- the least transferable figure here.",
+    "Unit costs are industry-typical estimates, not a real merchant's audited figures."
+  ]
+}

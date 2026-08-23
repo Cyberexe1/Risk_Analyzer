@@ -119,6 +119,8 @@ class Customer:
     home_ip: str
     fail_prone: float
     payout: str
+    devices: list = field(default_factory=list)
+    device_p: list = field(default_factory=list)
 
 
 def _circular_hour(rng: np.random.Generator, mu: float, kappa: float) -> float:
@@ -172,6 +174,18 @@ def build_customers(cfg: Config, rng: np.random.Generator, start: float, end: fl
     for c in customers:
         p = np.array(c.method_p, dtype=float)
         c.method_p = list(p / p.sum())
+
+    # Real people own several devices: a phone, a laptop, a work machine, a tablet.
+    # An earlier version gave every customer exactly one device, which made
+    # `is_new_device` a near-perfect fraud tell (gain 2163, PR-AUC 0.92) purely as
+    # a generator artefact. Device loyalty has to be realistic or that one feature
+    # does all the work.
+    for i, c in enumerate(customers):
+        k = int(rng.choice([1, 2, 3, 4], p=[0.22, 0.40, 0.26, 0.12]))
+        extra = [f"dev_{i:06d}_x{j}" for j in range(1, k)]
+        c.devices = [c.home_device] + extra
+        w = np.array([0.62] + list(rng.uniform(0.08, 0.30, len(extra))))
+        c.device_p = list(w / w.sum())
 
     # --- Hard negative cluster 1: family-shared devices -------------------
     # 2-4 real accounts on one physical tablet. Produces legitimate
@@ -291,14 +305,23 @@ def generate_legit(cfg, rng, customers, start, end, target):
         amounts = rng.lognormal(math.log(c.avg_amount), c.sigma, size=n)
         methods = rng.choice(len(PAYMENT_METHODS), size=n, p=c.method_p)
 
-        for t, amt, mi in zip(ts, amounts, methods):
+        dev_pick = rng.choice(len(c.devices), size=n, p=c.device_p)
+        # ~2.5% of events come from a fingerprint never seen before: new phone,
+        # browser update, cleared storage, incognito. This is the honest base rate
+        # of `is_new_device` firing on a completely legitimate customer.
+        fresh = rng.random(n) < 0.025
+
+        for j, (t, amt, mi) in enumerate(zip(ts, amounts, methods)):
             failed = rng.random() < c.fail_prone
+            device = (
+                f"dev_fresh_{c.cid}_{j}" if fresh[j] else c.devices[int(dev_pick[j])]
+            )
             ev = {
                 "ts": float(t),
                 "cid": c.cid,
                 "amount": round(float(amt), 2),
                 "method": PAYMENT_METHODS[int(mi)],
-                "device": c.home_device,
+                "device": device,
                 "ip": c.home_ip,
                 "status": "failed" if failed else "success",
                 "label": 0,
@@ -410,6 +433,25 @@ def generate_fraud(cfg, rng, customers, per_cust, start, end, n_fraud):
     by_id = {c.cid: c for c in customers}
     ring_id = 0
 
+    # Per-customer sorted event times, so a victim can be picked by TIME rather
+    # than by history depth. Selecting "customers with >= 15 events" and then
+    # anchoring inside their history pushed account takeover and refund abuse
+    # toward the end of the window -- 37% of all fraud landed late, and the
+    # validation split ended up at 3.07% fraud against 1.73% in train. Base rate
+    # differences across splits move PR-AUC on their own, which makes the metric
+    # unreadable.
+    times = {cid: np.array([e["ts"] for e in evs]) for cid, evs in per_cust.items()}
+    cid_list = [c for c in times if len(times[c]) >= 12]
+
+    def pick_victim(min_history: int = 10):
+        """Uniform in TIME first, then find an account with enough prior history."""
+        for _ in range(60):
+            t = float(rng.uniform(start + 20 * 86400, end - 86400))
+            cid = cid_list[int(rng.integers(0, len(cid_list)))]
+            if int(np.searchsorted(times[cid], t)) >= min_history:
+                return by_id.get(cid), t
+        return None, None
+
     # --- Card testing -----------------------------------------------------
     # Working through a list of stolen credentials. High volume, tight window,
     # mostly declines, small amounts to avoid triggering issuer limits.
@@ -420,6 +462,13 @@ def generate_fraud(cfg, rng, customers, per_cust, start, end, n_fraud):
         ipa = f"ip_ct_{ep // 3:05d}"  # a few episodes share infrastructure
         cid = f"CUST_CT_{ep:05d}"
         t0 = float(rng.uniform(start + 86400, end - 86400))
+        # ~30% are dormant "sleeper" accounts aged deliberately before use, which
+        # is exactly how operators defeat a naive account-age rule. Without these,
+        # account_age_hours alone separates fraud far too well.
+        if rng.random() < 0.30:
+            acct_created = t0 - float(rng.uniform(30, 400)) * 86400
+        else:
+            acct_created = t0 - float(rng.uniform(300, 172800))
         n = int(rng.integers(6, 26))
         window = float(rng.uniform(240, 1500))
         for j in range(n):
@@ -436,6 +485,7 @@ def generate_fraud(cfg, rng, customers, per_cust, start, end, n_fraud):
                     "status": "failed" if failed else "success",
                     "label": 1,
                     "fraud_type": "card_testing",
+                    "created_at": acct_created,
                 }
             )
         produced += n
@@ -445,14 +495,13 @@ def generate_fraud(cfg, rng, customers, per_cust, start, end, n_fraud):
     # --- Account takeover -------------------------------------------------
     # Real account, stolen credentials. New device, unusual hour, amount well
     # above the victim's own baseline. Detectable mainly via amount_ratio.
-    eligible = [c for c in customers if len(per_cust.get(c.cid, [])) >= 15]
     produced = 0
     guard = 0
-    while produced < quotas["account_takeover"] and eligible and guard < 100000:
+    while produced < quotas["account_takeover"] and cid_list and guard < 100000:
         guard += 1
-        c = eligible[int(rng.integers(0, len(eligible)))]
-        evs = per_cust[c.cid]
-        anchor = evs[int(rng.integers(len(evs) // 2, len(evs)))]["ts"]
+        c, anchor = pick_victim(12)
+        if c is None:
+            continue
         device = f"dev_ato_{c.cid}"
         ipa = f"ip_ato_{c.cid}"
         n = int(rng.integers(1, 5))
@@ -470,6 +519,7 @@ def generate_fraud(cfg, rng, customers, per_cust, start, end, n_fraud):
                     "status": "failed" if rng.random() < 0.25 else "success",
                     "label": 1,
                     "fraud_type": "account_takeover",
+                    "created_at": c.created_at,
                 }
             )
         produced += n
@@ -486,8 +536,15 @@ def generate_fraud(cfg, rng, customers, per_cust, start, end, n_fraud):
         ips = [f"ip_ring{ring_id:04d}_{d}" for d in range(max(1, n_dev // 2))]
         t0 = float(rng.uniform(start + 86400, end - 7 * 86400))
         base = float(rng.uniform(800, 6000))
+        # Rings age their mules too: a third of the accounts in a cluster were
+        # created well before the cashout window.
+        aged = rng.random() < 0.33
         for a in range(n_acct):
             cid = f"CUST_RING{ring_id:04d}_{a:02d}"
+            if aged:
+                acct_created = t0 - float(rng.uniform(20, 300)) * 86400
+            else:
+                acct_created = t0 - float(rng.uniform(600, 259200))
             k = int(rng.integers(1, 5))
             for j in range(k):
                 out.append(
@@ -501,6 +558,7 @@ def generate_fraud(cfg, rng, customers, per_cust, start, end, n_fraud):
                         "status": "failed" if rng.random() < 0.18 else "success",
                         "label": 1,
                         "fraud_type": "ring_cashout",
+                        "created_at": acct_created,
                     }
                 )
                 produced += 1
@@ -512,22 +570,23 @@ def generate_fraud(cfg, rng, customers, per_cust, start, end, n_fraud):
     # amounts on a normal-looking account. Most of the evidence is post-purchase.
     produced = 0
     guard = 0
-    while produced < quotas["refund_abuse"] and eligible and guard < 100000:
+    while produced < quotas["refund_abuse"] and cid_list and guard < 100000:
         guard += 1
-        c = eligible[int(rng.integers(0, len(eligible)))]
-        evs = per_cust[c.cid]
-        anchor = evs[int(rng.integers(0, len(evs)))]["ts"]
+        c, anchor = pick_victim(6)
+        if c is None:
+            continue
         out.append(
             {
-                "ts": anchor + float(rng.uniform(3600, 86400)),
+                "ts": min(end - 60, anchor + float(rng.uniform(3600, 86400))),
                 "cid": c.cid,
                 "amount": round(c.avg_amount * float(rng.uniform(1.8, 4.5)), 2),
                 "method": rng.choice(["card", "cod", "upi"]),
-                "device": c.home_device,
+                "device": c.devices[int(rng.integers(0, len(c.devices)))],
                 "ip": c.home_ip,
                 "status": "success",
                 "label": 1,
                 "fraud_type": "refund_abuse",
+                "created_at": c.created_at,
             }
         )
         produced += 1
@@ -999,7 +1058,8 @@ def main() -> None:
     # attach true account creation times where we know them
     created = {c.cid: c.created_at for c in customers}
     for e in events:
-        if e["cid"] in created:
+        # do not clobber creation times the fraud generator set deliberately
+        if "created_at" not in e and e["cid"] in created:
             e["created_at"] = created[e["cid"]]
 
     print("[4/6] forward feature pass (chronological, no lookahead)")

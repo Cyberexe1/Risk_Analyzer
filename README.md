@@ -187,50 +187,62 @@ Fraud rate defaults to 2%, not 10%, because precision depends directly on base r
 
 ## Headline metrics
 
-> **Not yet measured.** `train.py` and `evaluate.py` are not built. The figures below
-> are projected operating points that define what will be reported and how it will
-> be costed. They will be replaced by `ml/artifacts/metrics.json`.
+Measured on the held-out test split (14,913 transactions, 342 fraud, 2.29%). Regenerate with `python ml/train.py && python ml/evaluate.py`.
 
 | Metric | Value |
 | --- | --- |
-| PR-AUC | 0.83 |
-| ROC-AUC | 0.971 |
+| PR-AUC | **0.788** (validation 0.874) |
+| ROC-AUC | 0.940 — inflated by the 98% negative class |
+| Brier, calibrated | 0.0071, down from 0.0269 raw |
 
-Two thresholds, two operating points. Reporting only the flattering one would be dishonest, so both are here:
+Two thresholds, two operating points. Reporting only the flattering one would be dishonest:
 
 | Gate | Precision | Recall | FP rate | Volume |
 | --- | --- | --- | --- | --- |
-| `MANUAL REVIEW` (score >= 40) | 0.451 | 0.811 | 1.92% | 3.4% of traffic |
-| `BLOCK` (score >= 75) | 0.738 | 0.217 | 0.15% | 0.56% of traffic |
+| `MANUAL REVIEW` (>= 5) | 0.370 | 0.789 | 3.15% | 4.89% of traffic |
+| `BLOCK` (>= 70) | 1.000 | 0.553 | 0.00% | 1.27% of traffic |
 
-Queue precision is under half — of 257 flagged transactions, 116 were fraud. That is acceptable because a review costs Rs 35 of analyst time, while a wrongly blocked customer costs Rs 1,438 in lost margin and churn. Blocking is ~41x more expensive per error than reviewing, which is why the architecture routes most risk to a human and keeps `BLOCK` narrow.
+**Cost:** Rs 12.14 lakh loss if nothing is done, Rs 2.75 lakh with FraudShield — **Rs 9.40 lakh saved (77.4%)**. Of the remaining cost, Rs 16,065 is false-positive cost: 459 legitimate customers sent to review, zero blocked.
 
-On the test week: **Rs 3.88 lakh net saving**, of which **Rs 20,368 is false-positive cost paid by legitimate customers** — including 11 real orders declined.
+Three results that are not flattering, and matter more than the ones above:
 
-The data is synthetic and we generated it, so production performance will be worse. Confusion matrices, per-archetype recall, threshold sweep, cost sensitivity, fairness slices and failure modes are in [docs/EVALUATION.md](docs/EVALUATION.md). Every number regenerates from `make evaluate` into `ml/artifacts/metrics.json` — if the docs and the artifact disagree, trust the artifact.
+- **Block precision of 1.000 is a warning, not a win.** Zero false positives on 189 blocks means the synthetic generator's high-confidence fraud is too cleanly separable. Card-testing and ring recall both land at exactly 1.000. Real traffic will not behave this way.
+- **The ensemble is worse than XGBoost alone on ranking** — 0.788 vs 0.800 PR-AUC, precision 0.370 vs 0.675. The rule layer's floor contribution alone clears a review threshold of 5, dragging in legitimate rows the model had correctly ranked near zero. The rules and network layers earn their place on auditability and cold start, not accuracy.
+- **First-party abuse recall is 0.000.** Those rows are genuinely normal transactions that were relabelled, so there is nothing to detect. They plus refund abuse account for 70 of the 72 missed frauds, and missed fraud is 93% of all remaining cost. Better transaction scoring cannot fix this; it needs post-purchase evidence.
+
+Also worth knowing: the review threshold is set by **analyst capacity, not model quality**. At 100:1 cost asymmetry the optimiser always wants to review more, so `evaluate.py` enforces a queue-rate ceiling and the threshold sits against it.
+
+Full confusion matrices, per-archetype recall, threshold sweep, fairness slices and failure modes in [docs/EVALUATION.md](docs/EVALUATION.md). If the docs and `ml/artifacts/metrics.json` disagree, trust the artifact.
 
 ---
 
 ## Quickstart
 
-What runs today is the dataset generator. The service and training scripts are not built yet.
+The ML pipeline runs end to end today. The FastAPI service and React dashboards are not built yet.
 
 ```bash
 pip install -r requirements.txt
 
-python ml/generate_dataset.py --n 100000       # ~99k rows -> ml/data/
-python ml/generate_dataset.py --n 20000 --tag dev   # fast dev loop
+python ml/generate_dataset.py --n 100000   # ~99k rows -> ml/data/
+python ml/train.py                         # -> ml/artifacts/model.json + calibrator
+python ml/evaluate.py                      # -> ml/artifacts/metrics.json
 ```
 
-The generator prints its own difficulty report — per-feature AUC and how much fraud no simple rule catches — and warns if any single feature separates the classes too well.
+Roughly two minutes total on a laptop. The generator prints its own difficulty report — per-feature AUC and how much fraud no simple rule catches — and warns if any single feature separates the classes too well. `evaluate.py` prints the full threshold sweep, baseline comparison, cost breakdown, fairness slices and one worked SHAP explanation.
 
-Planned, once the service exists:
+Useful flags:
+
+```bash
+python ml/generate_dataset.py --n 20000 --tag dev   # fast iteration loop
+python ml/generate_dataset.py --fraud-rate 0.10     # demo mode, warns about base rate
+python ml/evaluate.py --max-review-rate 0.02        # tighter analyst capacity
+```
+
+Not built yet:
 
 ```bash
 docker compose up -d      # DynamoDB Local + API + web
 make bootstrap            # tables, seed products, demo users
-python ml/train.py
-python ml/evaluate.py
 ```
 
 - Storefront: http://localhost:5173/app
@@ -268,12 +280,15 @@ fraudshield/
 |   +-- features/             feature builders: velocity, baseline, graph
 |   +-- scoring/              ml.py, rules.py, network.py, aggregator.py
 |   +-- schemas/              Pydantic request / response models
-+-- ml/                       offline work
-|   +-- generate_dataset.py
-|   +-- train.py
-|   +-- evaluate.py
-|   +-- cost_model.py
-|   +-- artifacts/            model.json, calibrator.pkl, metrics.json
++-- ml/                       offline pipeline -- BUILT AND VERIFIED
+|   +-- generate_dataset.py   event simulation + forward feature pass
+|   +-- features.py           shared matrix builder + leakage assertion
+|   +-- scoring.py            rules, entity graph, aggregator, MVP baseline
+|   +-- cost_model.py         rupee cost of every outcome
+|   +-- train.py              XGBoost + isotonic calibration
+|   +-- evaluate.py           thresholds, baselines, cost, fairness slices
+|   +-- data/                 transactions.csv, promo_redemptions.csv
+|   +-- artifacts/            model.json, calibrator.json, metrics.json
 +-- web/                      React + Vite
 |   +-- src/
 |       +-- customer/         storefront, checkout, returns
