@@ -1,4 +1,4 @@
-import { useState } from 'react'
+﻿import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { ApiError } from '../api'
 import { passwordProblem, passwordStrength, useAuth } from '../auth'
@@ -41,7 +41,7 @@ export default function Signup() {
   return (
     <div className="wrap-narrow section-sm" style={{ maxWidth: 480 }}>
       <div className="card card-lift">
-        <h1 style={{ fontSize: '1.6rem' }}>Create your account</h1>
+        <h1 className="t-xl">Create your account</h1>
         <p>Free, and takes a few seconds.</p>
 
         {error && (
@@ -118,7 +118,7 @@ export default function Signup() {
               aria-describedby="pw2-help"
             />
             {mismatch && (
-              <p id="pw2-help" style={{ color: 'var(--block)', fontSize: 13, margin: '6px 0 0' }}>
+              <p id="pw2-help" className="t-sm" style={{ color: 'var(--block)', margin: '6px 0 0' }}>
                 Passwords do not match.
               </p>
             )}

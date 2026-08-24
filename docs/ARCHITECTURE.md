@@ -223,7 +223,20 @@ Short-window counters use bucketed sort keys (`WINDOW#10M#<epoch/600>`) plus Dyn
 
 ### Retention and PII
 
-- Raw IPs are **never** stored. We store `HMAC-SHA256(ip, server_pepper)`, so counters work but the address is not recoverable from a table dump.
+- Raw IPs are **never** stored. We store `HMAC-SHA256(ip, FRAUDSHIELD_IP_PEPPER)` truncated to 24 hex chars, so counters work but the address is not recoverable from a table dump. **Built** — `ip_hash_of()` in `backend.py`.
+- **The IP is derived server-side, never accepted from the client.** It used to be an `ip_hash` field in the request body, which made every IP-based control decorative: a caller could send a fresh value per request and walk past `ip_concentration`, ring detection and the promo gate's IP signals, or deliberately trigger the shared-IP exemption to suppress them. Now removed from `OrderRequest` and `RedeemRequest`.
+- `X-Forwarded-For` is honoured **only** from a peer listed in `FRAUDSHIELD_TRUSTED_PROXIES` (empty by default). Trusting that header from an arbitrary peer is the same hole with extra steps.
+- **uvicorn must be started with `--forwarded-allow-ips=""`.** Its default proxy-header handling rewrites `request.client.host` from `X-Forwarded-For` for any loopback caller, *before* application code runs. Verified: without that flag, sending `X-Forwarded-For: 203.0.113.7` changed the derived hash. With it, all three attacks below produce an identical hash:
+
+```text
+no header                     ip_fe1e6cd131597bcaec26e347
+X-Forwarded-For: 203.0.113.7  ip_fe1e6cd131597bcaec26e347
+ip_hash in request body       ip_fe1e6cd131597bcaec26e347
+```
+
+- Card PANs are **never** stored, logged, or passed to the risk engine. `validate_instrument` checks Luhn and expiry, derives `HMAC-SHA256(digits, pepper)` as a `card_fingerprint`, and discards the number. The fingerprint is what detects the same card across accounts — verified at 3 accounts sharing one card. A production integration would tokenise client-side so the PAN never reaches this server at all.
+- `device_fp` **remains client-supplied**, because a browser fingerprint inherently is. That is precisely why device signals must be corroborated by payout reuse, instrument reuse or velocity rather than trusted alone.
+- Order **amount** is computed from the catalogue and **settlement status** is decided by `simulate_authorisation`, not taken from the request. Both were previously client-declared — the same class of bug as the IP, letting a caller poison the velocity and failure-rate features.
 - Device fingerprints are client-generated opaque hashes. No canvas or audio fingerprinting, no cross-site tracking.
 - Card data never reaches FraudShield. The gateway returns a token; we store the token and a `card_fingerprint` for reuse counting.
 - Transaction items carry a 24-month TTL. Labels are retained for model lineage.
@@ -285,7 +298,7 @@ Controls in place:
 - Admin role can only be granted by a direct table write, never through an API endpoint
 - CORS locked to the known web origin; no wildcard with credentials
 
-`.env` needs `JWT_SECRET` and `IP_PEPPER` set to strong random values. The committed `.env.example` contains placeholders only. In AWS these come from Secrets Manager, and the task role gets scoped `dynamodb:GetItem / PutItem / Query / UpdateItem / TransactWriteItems` on the one table plus its indexes — nothing broader.
+`.env` needs `FRAUDSHIELD_JWT_SECRET` and `FRAUDSHIELD_IP_PEPPER` set to strong random values; both fall back to an ephemeral per-process value with a startup warning. Rotating the pepper invalidates every IP and card fingerprint, resetting entity counters and instrument-reuse history. The committed `.env.example` contains placeholders only. In AWS these come from Secrets Manager, and the task role gets scoped `dynamodb:GetItem / PutItem / Query / UpdateItem / TransactWriteItems` on the one table plus its indexes — nothing broader.
 
 ---
 
@@ -307,7 +320,7 @@ All routes are prefixed `/v1`. Full OpenAPI at `/docs`.
 
 | Method | Path | Purpose | Status |
 | --- | --- | --- | --- |
-| POST | `/orders` | Create order, score it, persist it | Built |
+| POST | `/orders` | Multi-item cart, method-specific instrument, score, authorise, persist | Built |
 | GET | `/orders` | Order history | Built |
 | GET | `/orders/{id}` | Order detail, customer-safe projection | Built |
 | POST | `/returns` | Request a return | Built |
@@ -330,11 +343,12 @@ The order response is **role-dependent**: a `customer` gets `order_id`, `status`
 | GET | `/admin/promo-holds` | Held and denied redemptions |
 | POST | `/admin/promo-holds/{id}/override` | Grant a denied offer, writes a label |
 | GET | `/admin/transactions/{id}` | Full scoring breakdown and reason codes |
-| GET | `/admin/rings/{entity_type}/{entity_id}` | Ring graph, nodes and edges |
+| GET | `/admin/rings/{entity_type}/{entity_id}` | Ring graph, nodes and edges. `entity_type` is `device`, `ip` or `account`; `depth` 1–3, capped at 200 nodes. Walks the same adjacency as the network score, so the picture and the sub-score cannot disagree. Does **not** yet emit card-fingerprint or payout-destination edges |
 | POST | `/admin/transactions/{id}/decision` | Record `fraud` / `legitimate`, writes a label |
 | GET | `/admin/metrics` | Live precision, recall, FP rate, cost |
-| GET | `/admin/thresholds` | Current cut-offs |
-| PUT | `/admin/thresholds` | Update cut-offs, audited |
+| GET | `/admin/thresholds` | Current cut-offs, the measured cost curve (159 points), and their projected effect on live traffic |
+| PUT | `/admin/thresholds` | Update cut-offs. **`admin` only** — an analyst decides individual cases, but a threshold change alters every future decision. Audited |
+| GET | `/admin/audit` | Threshold change history. `admin` only |
 
 ### Scoring response
 

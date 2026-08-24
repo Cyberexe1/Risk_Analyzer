@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+﻿import { useCallback, useEffect, useState } from 'react'
 import {
   ApiError,
   promoApi,
@@ -27,7 +27,7 @@ const STATUS: Record<string, { label: string; cls: string; glyph: string }> = {
 }
 
 /**
- * Offer claiming — the promo abuse gate's customer-facing surface.
+ * Offer claiming â€” the promo abuse gate's customer-facing surface.
  *
  * Promo abuse is scored here, not at checkout: by the time a payment is scored
  * the cashback is already credited. And the evidence lives in relationships
@@ -70,7 +70,8 @@ export default function Offers() {
         await promoApi.redeem({
           promo_code: code,
           device_fp: shared ? 'dev_demo_shared_promo' : deviceFingerprint(),
-          ip_hash: shared ? 'ip_demo_shared_promo' : 'ip_web_self',
+          // No ip_hash: the backend derives it from the connection. A client that
+          // could choose its own would walk past every IP-based signal.
           payout_ref: shared ? 'upi_demo_shared' : `upi_${user?.user_id.slice(0, 10)}`,
         }),
       )
@@ -87,7 +88,7 @@ export default function Offers() {
 
   return (
     <div className="wrap section-sm">
-      <h1 style={{ fontSize: '1.9rem' }}>Offers</h1>
+      <h1>Offers</h1>
       <p style={{ maxWidth: 620 }}>
         One claim per account. Claims are checked against the accounts, devices and
         payout destinations already linked to yours.
@@ -130,7 +131,7 @@ export default function Offers() {
           <div className="card" key={o.code}>
             <div className="spread" style={{ marginBottom: 8 }}>
               <h3 style={{ margin: 0 }}>{o.name}</h3>
-              <span className="mono" style={{ fontWeight: 700, fontSize: 18 }}>
+              <span className="num t-md">
                 {rupees(o.value)}
               </span>
             </div>
@@ -192,7 +193,7 @@ export default function Offers() {
 
       {!!mine.length && (
         <>
-          <h2 style={{ fontSize: '1.3rem', marginTop: 36 }}>Your claims</h2>
+          <h2 className="t-lg" style={{ marginTop: 'var(--sp-10)' }}>Your claims</h2>
           <div className="table-shell">
             <table>
               <caption className="sr-only">Your promotion claims</caption>

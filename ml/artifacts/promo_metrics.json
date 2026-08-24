@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-23T13:37:43.227128+00:00",
+  "generated_at": "2026-08-23T17:02:28.545174+00:00",
   "data_file": "ml\\data\\promo_redemptions.csv",
   "scored_by": "backend.score_promo (same code path as POST /v1/promo/redeem)",
   "thresholds": {

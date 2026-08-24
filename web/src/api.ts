@@ -60,6 +60,11 @@ export interface QueueItem {
   override: string | null
   scored_at: string
   label: string | null
+  /** present on orders placed through /v1/orders; lets the console pivot to the ring */
+  device_fp?: string
+  ip_hash?: string
+  /** origin address flagged for a burst of failed payments; not a scoring input */
+  ip_suspicious?: boolean
 }
 
 export interface Health {
@@ -126,6 +131,8 @@ export function getAccessToken() {
 }
 
 async function raw(path: string, init?: RequestInit): Promise<Response> {
+  // PUT is used by the threshold tuner; the backend's CORS allow_methods must
+  // include it or the preflight fails.
   try {
     return await fetch(`${BASE}${path}`, {
       ...init,
@@ -200,29 +207,92 @@ export interface Product {
   id: string
   name: string
   price: number
+  category: string
+  stock: number
 }
+
+export interface PaymentMethodMeta {
+  code: string
+  label: string
+  needs: 'vpa' | 'card' | 'bank' | 'wallet' | null
+}
+
+export interface Catalogue {
+  products: Product[]
+  payment_methods: PaymentMethodMeta[]
+  banks: { code: string; name: string }[]
+  wallets: string[]
+}
+
+export interface OrderLine {
+  product_id: string
+  name: string
+  qty: number
+  unit_price: number
+}
+
+export type OrderStatus = 'confirmed' | 'verifying' | 'declined' | 'declined_by_bank'
 
 export interface Order {
   order_id: string
   product_name: string
+  items: OrderLine[]
+  item_count: number
   amount: number
   payment_method: string
+  instrument_display: string | null
   created_at: string
-  status: 'confirmed' | 'verifying' | 'declined'
+  status: OrderStatus
   return_status: string | null
   /** staff only — the backend omits these for customers */
   risk_score?: number
   decision?: Decision
   sub_scores?: SubScores
   transaction_id?: string
+  settlement?: string
+  instrument_account_count?: number
+}
+
+/** `ip_hash` is deliberately absent: the backend derives it from the connection.
+ *  A client that could choose its own would walk past every IP-based control. */
+export interface CreateOrderBody {
+  items: { product_id: string; qty: number }[]
+  payment_method: string
+  device_fp: string
+  card?: {
+    number: string
+    expiry_month: number
+    expiry_year: number
+    cvv: string
+    holder?: string
+  }
+  upi?: { vpa: string }
+  netbanking?: { bank_code: string }
+  wallet?: { provider: string; phone: string }
+}
+
+/** An address flagged for a burst of failed payments. */
+export interface IpFlag {
+  /** True only on the attempt that first raised the flag. */
+  new?: boolean
+  ip_hash: string
+  since: string
+  reason: string
+  failures_in_window?: number
+  failures_total: number
+  accounts: number
 }
 
 export interface OrderResult {
   order_id: string
-  status: 'confirmed' | 'verifying' | 'declined'
+  status: OrderStatus
   message: string
-  product_name: string
+  items: OrderLine[]
   amount: number
+  payment_method: string
+  instrument_display: string
+  /** 'success' | 'failed' — the authorisation outcome, distinct from the risk decision. */
+  settlement?: string
   risk?: {
     transaction_id: string
     risk_score: number
@@ -230,7 +300,38 @@ export interface OrderResult {
     sub_scores: SubScores
     reason_codes: ReasonCode[]
     override: string | null
+    settlement: string
+    ip_hash: string
+    instrument_account_count: number
+    /** Present and non-null only when this attempt left the address flagged. */
+    ip_suspicious?: IpFlag | null
   }
+}
+
+export interface FailedAttempt {
+  attempt_id: string
+  order_id: string
+  transaction_id: string
+  customer_id: string
+  email: string
+  amount: number
+  payment_method: string
+  instrument_display: string
+  device_fp: string
+  ip_hash: string
+  risk_score: number
+  decision: Decision
+  customer_status: string
+  created_at: string
+  ip_suspicious?: boolean
+}
+
+export interface SuspiciousIp extends IpFlag {
+  transactions: number
+  source: 'live' | 'persisted'
+  attempts: FailedAttempt[]
+  attempt_count: number
+  accounts_involved: string[]
 }
 
 export interface ReturnRecord {
@@ -245,13 +346,9 @@ export interface ReturnRecord {
 }
 
 export const shopApi = {
-  products: () => req<{ products: Product[] }>('/v1/catalog/products'),
-  createOrder: (body: {
-    product_id: string
-    payment_method: string
-    device_fp: string
-    ip_hash: string
-  }) => req<OrderResult>('/v1/orders', { method: 'POST', body: JSON.stringify(body) }),
+  catalogue: () => req<Catalogue>('/v1/catalog/products'),
+  createOrder: (body: CreateOrderBody) =>
+    req<OrderResult>('/v1/orders', { method: 'POST', body: JSON.stringify(body) }),
   orders: () => req<{ count: number; orders: Order[] }>('/v1/orders'),
   requestReturn: (order_id: string, reason: string, detail: string) =>
     req<{ return_id: string; status: string; message: string }>('/v1/returns', {
@@ -304,14 +401,140 @@ export interface PromoHold {
   features: Record<string, number>
 }
 
+export interface GateMetrics {
+  threshold: number
+  precision: number
+  recall: number
+  fp_rate: number
+  volume_share: number
+  tp: number
+  fp: number
+  fn: number
+  tn: number
+}
+
+export interface TransactionMetrics {
+  test_rows: number
+  test_fraud: number
+  test_fraud_rate: number
+  ranking: { pr_auc: number; roc_auc: number; brier_calibrated: number }
+  thresholds: { review: number; block: number }
+  review_gate: GateMetrics
+  block_gate: GateMetrics
+  confusion: {
+    tp_block: number
+    fp_block: number
+    tp_review: number
+    fp_review: number
+    fn: number
+    tn: number
+  }
+  recall_by_archetype: Record<string, number>
+  baselines: Record<string, { pr_auc: number; cost: number }>
+  cost: {
+    do_nothing: number
+    with_fraudshield: number
+    net_saving: number
+    net_saving_pct: number
+    false_positive_cost: number
+    false_positive_share_of_remaining: number
+    legit_blocked: number
+    unit_costs: Record<string, number>
+  }
+  fairness: Record<string, { n: number; review_rate: number; block_rate: number; ratio_vs_overall: number }>
+  caveats: string[]
+}
+
+export interface PromoMetrics {
+  abuse_rate: { overall: number; validation: number; test: number }
+  rows: { total: number; validation: number; test: number }
+  gate: { precision: number; recall: number; fp_rate: number; tp: number; fp: number; fn: number; tn: number }
+  deny: { n: number; fp: number; precision: number | null }
+  hold: { n: number; fp: number; precision: number | null }
+  per_rule: Record<string, { detections: number; precision: number | null; action?: string }>
+  thresholds: Record<string, number>
+  cost: {
+    no_gate: number
+    with_gate: number
+    net_saving: number
+    false_positive_cost: number
+  }
+  caveats: string[]
+}
+
+export interface AdminMetrics {
+  transaction: TransactionMetrics | null
+  promo: PromoMetrics | null
+  missing: string[]
+}
+
+export interface RingNode {
+  id: string
+  type: 'account' | 'device' | 'ip'
+  label: string
+  is_seed: boolean
+  txn_count?: number
+  fail_count?: number
+  active_24h?: number
+  account_count?: number
+  suspicious?: boolean
+  shared_infra?: boolean
+}
+
+export interface RingEdge {
+  source: string
+  target: string
+  kind: 'device' | 'ip'
+}
+
+export interface RingGraph {
+  seed: { type: string; id: string }
+  depth: number
+  truncated: boolean
+  counts: { accounts: number; devices: number; ips: number; edges: number }
+  nodes: RingNode[]
+  edges: RingEdge[]
+}
+
+export interface SweepPoint {
+  review: number
+  block: number
+  cost: number
+  review_volume: number
+  legit_blocked: number
+  within_capacity: boolean
+}
+
+export interface LiveProjection {
+  review: number
+  block: number
+  would_block: number
+  would_review: number
+  review_share: number
+}
+
+export interface ThresholdInfo {
+  current: { review: number; block: number }
+  source: string
+  cost_curve: SweepPoint[]
+  cost_curve_note: string
+  live_projection: LiveProjection[]
+  live_sample_size: number
+  caveat: string
+}
+
+export interface AuditEntry {
+  actor: string
+  action: string
+  before: { review: number; block: number }
+  after: { review: number; block: number }
+  at: string
+}
+
 export const promoApi = {
   offers: () => req<{ offers: Offer[] }>('/v1/promo/offers'),
-  redeem: (body: {
-    promo_code: string
-    device_fp: string
-    ip_hash: string
-    payout_ref: string
-  }) => req<RedeemResult>('/v1/promo/redeem', { method: 'POST', body: JSON.stringify(body) }),
+  redeem: (body: { promo_code: string; device_fp: string; payout_ref: string }) =>
+    req<RedeemResult>('/v1/promo/redeem', { method: 'POST', body: JSON.stringify(body) }),
   mine: () => req<{ count: number; redemptions: MyRedemption[] }>('/v1/promo/mine'),
   holds: () => req<{ count: number; items: PromoHold[] }>('/v1/admin/promo-holds'),
   override: (rid: string) =>
@@ -334,6 +557,25 @@ export const api = {
       body: JSON.stringify(body),
     }),
   queue: () => req<{ count: number; items: QueueItem[] }>('/v1/admin/queue'),
+  metrics: () => req<AdminMetrics>('/v1/admin/metrics'),
+  ring: (type: 'device' | 'ip' | 'account', id: string, depth = 2) =>
+    req<RingGraph>(`/v1/admin/rings/${type}/${encodeURIComponent(id)}?depth=${depth}`),
+  thresholds: () => req<ThresholdInfo>('/v1/admin/thresholds'),
+  setThresholds: (review: number, block: number) =>
+    req<{ current: { review: number; block: number }; previous: { review: number; block: number } }>(
+      '/v1/admin/thresholds',
+      { method: 'PUT', body: JSON.stringify({ review, block }) },
+    ),
+  audit: () => req<{ count: number; entries: AuditEntry[] }>('/v1/admin/audit'),
+  suspiciousIps: () =>
+    req<{
+      count: number
+      threshold: number
+      window_minutes: number
+      items: SuspiciousIp[]
+    }>('/v1/admin/suspicious-ips'),
+  failedAttempts: () =>
+    req<{ count: number; items: FailedAttempt[] }>('/v1/admin/failed-attempts'),
   outcome: (id: string, label: 'fraud' | 'legitimate') =>
     req<{ transaction_id: string; label: string }>(
       `/v1/admin/transactions/${id}/outcome`,

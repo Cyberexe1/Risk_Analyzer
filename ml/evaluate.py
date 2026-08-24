@@ -411,6 +411,11 @@ def main() -> None:
         "baselines": baselines,
         "aggregation_weight_search": weight_rows,
         "threshold_sweep_top10": sweep[:10],
+        # Full grid, ordered by threshold rather than cost, so the admin console can
+        # draw a cost curve instead of only showing the winner. Cheap to store
+        # (~200 rows) and it is the only way an operator can see that the optimum
+        # is flat-bottomed rather than a sharp peak.
+        "threshold_sweep": sorted(sweep, key=lambda r: (r["review"], r["block"])),
         "cost": {
             "unit_costs": COSTS.as_dict(),
             "do_nothing": round(nothing, 2),

@@ -42,4 +42,11 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"
 
-CMD ["uvicorn", "backend:app", "--host", "0.0.0.0", "--port", "8000"]
+# --forwarded-allow-ips="" is REQUIRED, not cosmetic. uvicorn otherwise rewrites
+# request.client.host from X-Forwarded-For for any loopback caller, which would let
+# a request choose its own IP and walk straight past ip_concentration, ring
+# detection and the promo gate's IP signals. If a real reverse proxy is added, set
+# FRAUDSHIELD_TRUSTED_PROXIES to its address instead of re-enabling this.
+CMD ["uvicorn", "backend:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--forwarded-allow-ips="]
+

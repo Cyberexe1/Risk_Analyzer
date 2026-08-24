@@ -12,9 +12,21 @@ merchant, and the churn term in particular is soft -- see sensitivity() below.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, asdict
+from pathlib import Path
 
-AOV = 2400.0
+# The unit costs live in backend.py, the serving module, because the threshold
+# tuner needs them at request time and ml/ is not in the deployed image. Imported
+# here rather than duplicated -- two copies of these numbers would drift and the
+# evaluation would silently cost errors differently than the live console does.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from backend import (  # noqa: E402
+    COST_AOV, COST_BLOCK_LEGIT, COST_FRAUD, COST_PROMO_VALUE,
+    COST_PROMO_WRONG_DENY, COST_REVIEW,
+)
+
+AOV = COST_AOV
 CONTRIBUTION_MARGIN = 0.12
 CUSTOMER_LIFETIME_VALUE = 5750.0
 CHURN_PROB_AFTER_WRONG_BLOCK = 0.20
@@ -24,26 +36,23 @@ CHURN_PROB_AFTER_WRONG_BLOCK = 0.20
 class CostModel:
     # Fraud we allowed through: goods gone, plus the bank's chargeback fee and
     # the staff time to handle the dispute.
-    fraud_loss: float = AOV + 750.0 + 400.0            # 3550
+    fraud_loss: float = COST_FRAUD                      # 3550
 
     # An analyst at ~Rs 42,000/month spending ~3 minutes on a case, loaded.
     # Paid on every review, right or wrong.
-    review_cost: float = 35.0
+    review_cost: float = COST_REVIEW
 
     # A real customer we declined. Lost margin now, plus the expected value of
     # them never coming back. This is the number that constrains the whole design.
-    block_legit_cost: float = (
-        AOV * CONTRIBUTION_MARGIN
-        + CUSTOMER_LIFETIME_VALUE * CHURN_PROB_AFTER_WRONG_BLOCK
-    )                                                   # 1438
+    block_legit_cost: float = COST_BLOCK_LEGIT          # 1438
 
     # Fraud we blocked: no loss. The avoided fraud_loss is the benefit.
     fraud_blocked_cost: float = 0.0
 
     # --- promo gate ---
-    promo_value: float = 500.0
-    promo_wrong_deny_cost: float = 500.0 + 260.0        # offer withheld + goodwill
-    promo_review_cost: float = 35.0
+    promo_value: float = COST_PROMO_VALUE
+    promo_wrong_deny_cost: float = COST_PROMO_WRONG_DENY   # offer + goodwill
+    promo_review_cost: float = COST_REVIEW
 
     def as_dict(self) -> dict:
         d = asdict(self)

@@ -67,8 +67,8 @@ export function ScoreDial({
 export function SubScoreBars({ sub }: { sub: SubScores }) {
   const rows: Array<[string, number, string]> = [
     ['ML model', sub.ml, 'var(--accent)'],
-    ['Behavioural rules', sub.rules, '#7b5cff'],
-    ['Network / ring', sub.network, '#00b8d4'],
+    ['Behavioural rules', sub.rules, 'var(--violet)'],
+    ['Network / ring', sub.network, 'var(--cyan)'],
   ]
   return (
     <div className="stack">

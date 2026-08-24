@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+﻿import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
   ApiError,
@@ -22,12 +22,15 @@ const STATUS_STYLE: Record<Order['status'], { label: string; glyph: string; colo
   confirmed: { label: 'Confirmed', glyph: '\u25CF', colour: 'var(--allow)' },
   verifying: { label: 'Verifying', glyph: '\u25C6', colour: 'var(--review)' },
   declined: { label: 'Declined', glyph: '\u25B2', colour: 'var(--block)' },
+  // An innocent bank decline, not a risk decision. Showing it as "declined" full
+  // stop would imply suspicion the system never expressed.
+  declined_by_bank: { label: 'Bank declined', glyph: '\u25C6', colour: 'var(--review)' },
 }
 
 /**
  * Customer dashboard: order history and the return-request flow.
  *
- * Notice what is absent for a customer — no risk score, no sub-scores, no reason
+ * Notice what is absent for a customer â€” no risk score, no sub-scores, no reason
  * codes. The backend's order projection is allow-list based, so those fields are
  * never sent to a `customer` role in the first place. Staff see them because the
  * same endpoint widens its response for `analyst`/`admin`.
@@ -84,7 +87,7 @@ export default function Orders() {
     <div className="wrap section-sm">
       <div className="spread" style={{ marginBottom: 8 }}>
         <div>
-          <h1 style={{ fontSize: '1.9rem', marginBottom: 4 }}>Your orders</h1>
+          <h1>Your orders</h1>
           <p className="muted" style={{ margin: 0 }}>
             Signed in as {user?.email}
           </p>
@@ -140,13 +143,18 @@ export default function Orders() {
                 <div className="spread">
                   <div>
                     <div style={{ fontWeight: 600 }}>{o.product_name}</div>
-                    <div className="muted mono" style={{ fontSize: 12 }}>
+                    {o.items.length > 1 && (
+                      <div className="muted t-sm">
+                        {o.items.map((l) => `${l.name} x${l.qty}`).join(', ')}
+                      </div>
+                    )}
+                    <div className="muted mono t-xs">
                       {o.order_id} &middot; {new Date(o.created_at).toLocaleString()} &middot;{' '}
-                      {o.payment_method.toUpperCase()}
+                      {o.instrument_display ?? o.payment_method.toUpperCase()}
                     </div>
                   </div>
                   <div style={{ textAlign: 'right' }}>
-                    <div className="mono" style={{ fontWeight: 700, fontSize: 16 }}>
+                    <div className="num t-base">
                       {rupees(o.amount)}
                     </div>
                     <span
@@ -176,6 +184,13 @@ export default function Orders() {
                         {Math.round(o.sub_scores.network)}
                       </span>
                     )}
+                    {o.settlement && <span className="chip">settled: {o.settlement}</span>}
+                    {o.instrument_account_count !== undefined &&
+                      o.instrument_account_count > 1 && (
+                        <span className="chip">
+                          instrument on {o.instrument_account_count} accounts
+                        </span>
+                      )}
                   </div>
                 )}
 
@@ -246,7 +261,9 @@ export default function Orders() {
                     <span className="muted">
                       {o.status === 'verifying'
                         ? 'Payment verification in progress.'
-                        : 'This payment did not go through.'}
+                        : o.status === 'declined_by_bank'
+                          ? 'Your bank declined this payment. Try another method.'
+                          : 'This payment did not go through.'}
                     </span>
                   )}
                 </div>
@@ -258,7 +275,7 @@ export default function Orders() {
 
       {!!returns.length && (
         <>
-          <h2 style={{ fontSize: '1.3rem', marginTop: 36 }}>Returns</h2>
+          <h2 className="t-lg" style={{ marginTop: 'var(--sp-10)' }}>Returns</h2>
           <div className="table-shell">
             <table>
               <caption className="sr-only">Your return requests</caption>

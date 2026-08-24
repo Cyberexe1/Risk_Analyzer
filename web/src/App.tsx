@@ -1,8 +1,11 @@
-import { NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
+﻿import { NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import type { ReactNode } from 'react'
 import { useAuth } from './auth'
+import { useCart } from './cart'
 import Landing from './pages/Landing'
 import Checkout from './pages/Checkout'
+import Cart from './pages/Cart'
+import Dashboard from './pages/Dashboard'
 import Orders from './pages/Orders'
 import Offers from './pages/Offers'
 import Admin from './pages/Admin'
@@ -13,17 +16,23 @@ function UserMenu() {
   const { user, loading, logout } = useAuth()
 
   if (loading) {
-    return <span className="muted" style={{ fontSize: 13 }}>&hellip;</span>
+    return <span className="muted">&hellip;</span>
   }
 
   if (!user) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        {/* Same endpoint, same form, same credential check as a customer login.
+            The role comes from the account, not from which button was pressed —
+            a separate admin auth path would double the attack surface and drift. */}
+        <NavLink to="/login?staff=1" className="nav-link">
+          Analyst console
+        </NavLink>
         <NavLink to="/login" className="btn btn-ghost btn-sm">
           Log in
         </NavLink>
         <NavLink to="/signup" className="btn btn-sm">
-          Sign up
+          Get started
         </NavLink>
       </div>
     )
@@ -31,18 +40,50 @@ function UserMenu() {
 
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-      <span
-        className="chip"
-        title={`${user.email} — role: ${user.role}`}
-        style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis' }}
-      >
-        {user.email}
-      </span>
+      {/* The address is deliberately not rendered here. The header sits on every
+          page, including ones a customer may screen-share or demo, and an email is
+          the one identifier that is both personal and useless to them — they know
+          which account they signed into. The role badge is what actually changes
+          what they can do, so that is what earns the space. The full address is on
+          the dashboard, one click away, where it is the subject of the page. */}
       <span className="badge badge-neutral">{user.role}</span>
       <button className="btn btn-ghost btn-sm" onClick={() => void logout()}>
         Log out
       </button>
     </div>
+  )
+}
+
+/**
+ * Cart button with a live count.
+ *
+ * The count is announced politely rather than assertively — a badge that
+ * interrupts a screen reader mid-sentence on every "add to cart" is worse than
+ * one that waits for a pause.
+ */
+function CartButton() {
+  const { count } = useCart()
+  return (
+    <NavLink
+      to="/cart"
+      className="cart-btn"
+      aria-label={
+        count === 0 ? 'Cart, empty' : `Cart, ${count} item${count === 1 ? '' : 's'}`
+      }
+    >
+      <span aria-hidden="true" className="cart-glyph">
+        {'\u25A4'}
+      </span>
+      <span className="cart-label">Cart</span>
+      {count > 0 && (
+        <span className="cart-count" aria-hidden="true">
+          {count}
+        </span>
+      )}
+      <span className="sr-only" aria-live="polite">
+        {count} item{count === 1 ? '' : 's'} in cart
+      </span>
+    </NavLink>
   )
 }
 
@@ -68,11 +109,14 @@ function Nav() {
           </NavLink>
           {user && (
             <>
-              <NavLink to="/offers" className="nav-link">
-                Offers
+              <NavLink to="/dashboard" className="nav-link">
+                Dashboard
               </NavLink>
               <NavLink to="/orders" className="nav-link">
-                My orders
+                Orders
+              </NavLink>
+              <NavLink to="/offers" className="nav-link">
+                Offers
               </NavLink>
             </>
           )}
@@ -83,6 +127,7 @@ function Nav() {
               Console
             </NavLink>
           )}
+          <CartButton />
           <span
             aria-hidden="true"
             style={{ width: 1, height: 24, background: 'var(--line)', margin: '0 6px' }}
@@ -94,7 +139,7 @@ function Nav() {
   )
 }
 
-/** Any signed-in user. A convenience gate — the backend still checks the token on
+/** Any signed-in user. A convenience gate â€” the backend still checks the token on
  *  every request, so this only avoids rendering a page that would 401. */
 function RequireAuth({ children }: { children: ReactNode }) {
   const { user, loading } = useAuth()
@@ -124,7 +169,7 @@ function RequireStaff({ children }: { children: ReactNode }) {
     return (
       <div className="wrap-narrow section">
         <div className="card">
-          <h1 style={{ fontSize: '1.5rem' }}>Not your console</h1>
+          <h1 className="t-xl">Not your console</h1>
           <p>
             The analyst console needs an <code>analyst</code> or <code>admin</code> role.
             You are signed in as <code>{user.role}</code>.
@@ -142,17 +187,28 @@ function RequireStaff({ children }: { children: ReactNode }) {
 
 export default function App() {
   return (
-    <>
+    <div className="app-shell">
       <a href="#main" className="sr-only">
         Skip to content
       </a>
       <Nav />
-      <main id="main">
+      <main id="main" className="app-main">
         <Routes>
           <Route path="/" element={<Landing />} />
           <Route path="/checkout" element={<Checkout />} />
+          {/* Public like the shop. The payment step inside gates on a session
+              itself, so an anonymous visitor can still review a cart. */}
+          <Route path="/cart" element={<Cart />} />
           <Route path="/login" element={<Login />} />
           <Route path="/signup" element={<Signup />} />
+          <Route
+            path="/dashboard"
+            element={
+              <RequireAuth>
+                <Dashboard />
+              </RequireAuth>
+            }
+          />
           <Route
             path="/orders"
             element={
@@ -190,16 +246,25 @@ export default function App() {
           />
         </Routes>
       </main>
-      <footer
-        style={{ borderTop: '1px solid var(--line-soft)', padding: '28px 0', marginTop: 40 }}
-      >
-        <div className="wrap spread">
-          <span className="muted">
-            FraudShield &middot; defense-only risk scoring &middot; synthetic data
-          </span>
-          <span className="muted">Routing decisions, not fraud verdicts.</span>
+      {/* Two-column editorial footer. No Privacy/Terms links: they would be dead
+          ends on a defense-only demo, and a link that goes nowhere is worse than
+          an absent one. The tagline carries the scope claim instead. */}
+      <footer className="site-footer">
+        <div className="wrap footer-inner">
+          <div className="footer-col">
+            <span className="footer-brand">FraudShield</span>
+            <span className="footer-meta">
+              Defense-only risk scoring &middot; synthetic data
+            </span>
+          </div>
+          <div className="footer-col footer-col-end">
+            <span className="footer-tagline">Routing decisions, not fraud verdicts.</span>
+            <span className="footer-meta">
+              Scores route attention. They are never a verdict of fraud.
+            </span>
+          </div>
         </div>
       </footer>
-    </>
+    </div>
   )
 }

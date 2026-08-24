@@ -51,6 +51,8 @@ Binds 127.0.0.1 by default. Keep it there until the auth layer exists.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -92,6 +94,73 @@ CORS_ORIGINS = [
     ).split(",")
     if o.strip()
 ]
+
+# ---------------------------------------------------------------------------
+# Client IP derivation
+# ---------------------------------------------------------------------------
+#
+# The IP identifier MUST be derived server-side. It used to be a request-body
+# field, which made every IP-based control decorative: an attacker who read the
+# API could send a fresh `ip_hash` per request and walk straight past
+# ip_concentration, ring detection, and the promo gate's IP signals. Worse, they
+# could deliberately trigger the shared-IP exemption to suppress those signals.
+#
+# X-Forwarded-For is only honoured from a configured trusted proxy. Blindly
+# trusting that header is the same hole with extra steps -- anyone can send it.
+IP_PEPPER = os.environ.get("FRAUDSHIELD_IP_PEPPER", "")
+if not IP_PEPPER:
+    IP_PEPPER = secrets.token_urlsafe(32)
+    _IP_PEPPER_EPHEMERAL = True
+else:
+    _IP_PEPPER_EPHEMERAL = False
+
+TRUSTED_PROXIES = {
+    p.strip()
+    for p in os.environ.get("FRAUDSHIELD_TRUSTED_PROXIES", "").split(",")
+    if p.strip()
+}
+
+
+def client_ip(request: "Request") -> str:
+    """The peer address, or the client end of X-Forwarded-For behind a trusted proxy.
+
+    DEPLOYMENT REQUIREMENT -- uvicorn undermines this by default.
+
+    uvicorn ships with proxy-header handling enabled and `forwarded_allow_ips`
+    defaulting to 127.0.0.1. When a request arrives from loopback it REWRITES
+    request.client.host from X-Forwarded-For before this function ever runs, so a
+    local caller can pick its own address and the check below never sees the real
+    peer. Verified: sending `X-Forwarded-For: 203.0.113.7` changed the derived IP.
+
+    So the server must be started with forwarded headers disabled unless a real
+    proxy sits in front:
+
+        uvicorn backend:app --forwarded-allow-ips=""
+
+    That is what the Dockerfile does. With it disabled, this function is the only
+    thing deciding the address, and TRUSTED_PROXIES is the only way to opt into
+    X-Forwarded-For.
+    """
+    peer = request.client.host if request.client else "unknown"
+    if peer in TRUSTED_PROXIES:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            # Leftmost entry is the original client. Only trustworthy because the
+            # immediate peer is a proxy we control.
+            return xff.split(",")[0].strip()
+    return peer
+
+
+def ip_hash_of(request: "Request") -> str:
+    """HMAC-SHA256(ip, pepper), truncated.
+
+    Raw addresses are never stored, so counters work but a table dump does not
+    reveal who connected from where. Matches the guarantee in
+    docs/ARCHITECTURE.md section 3.
+    """
+    ip = client_ip(request)
+    mac = hmac.new(IP_PEPPER.encode(), ip.encode(), hashlib.sha256).hexdigest()
+    return f"ip_{mac[:24]}"
 
 
 # =============================================================================
@@ -265,10 +334,30 @@ class DeviceState:
     n_fail: int = 0
 
 
+# Failed-payment tracking per IP.
+#
+# A declined authorisation is not evidence of fraud on its own -- cards expire,
+# balances run out, issuers have bad days. A BURST of declines from one address is
+# different: it is the shape card testing leaves behind, where an attacker walks a
+# list of stolen numbers until one authorises.
+#
+# So the trigger is a count inside a window, not a lifetime total. Without the
+# window a legitimate customer who mistypes a card three times over six months is
+# eventually indistinguishable from an attacker.
+IP_FAIL_WINDOW = 3600.0
+IP_FAIL_THRESHOLD = 3
+
+
 @dataclass
 class IPState:
     accounts: set[str] = field(default_factory=set)
     n_txn: int = 0
+    # Failed authorisations. NOT a model feature -- see the note on
+    # evaluate_ip_suspicion for why this stays out of the scoring path.
+    n_fail: int = 0
+    failures: deque = field(default_factory=deque)
+    suspicious_at: float | None = None
+    suspicious_reason: str = ""
 
 
 class Store(Protocol):
@@ -380,6 +469,13 @@ class InMemoryStore:
         p = self._ip[ipa]
         p.accounts.add(cid)
         p.n_txn += 1
+        # Counted here so the historical warm-up and the live path agree. Counting
+        # is not flagging: evaluate_ip_suspicion decides that, and only for live
+        # traffic, so replaying months of archived declines cannot manufacture a
+        # backlog of flagged addresses.
+        if failed:
+            p.n_fail += 1
+            p.failures.append(ts)
 
         self.acct_devices[cid].add(dev)
         self.acct_ips[cid].add(ipa)
@@ -400,6 +496,76 @@ class InMemoryStore:
     def account_totals(self, cid: str) -> tuple[int, int]:
         c = self._cust[cid]
         return c.n_txn, c.n_fail
+
+    # ---- failed-payment tracking -------------------------------------------
+    #
+    # Deliberately NOT wired into build_online_features. Adding a 23rd feature
+    # would invalidate every number in docs/EVALUATION.md, because the model was
+    # trained and measured on 22. This is an operational signal for analysts, and
+    # promoting it into the score is a retrain, not an edit.
+
+    def ip_failures_recent(self, h: str, now: float, window: float = IP_FAIL_WINDOW) -> int:
+        """Failed authorisations from this address inside the trailing window."""
+        p = self._ip[h]
+        while p.failures and now - p.failures[0] > window:
+            p.failures.popleft()
+        return len(p.failures)
+
+    def ip_is_suspicious(self, h: str) -> bool:
+        return self._ip[h].suspicious_at is not None
+
+    def evaluate_ip_suspicion(self, h: str, now: float) -> dict | None:
+        """Flag an address once its recent declines cross the threshold.
+
+        Returns the mark when one is newly applied or already standing, else None.
+
+        Shared infrastructure is exempt: a mobile carrier NAT or an office range
+        legitimately carries many unrelated accounts, and their declines pool at
+        one address through no fault of anyone behind it. Without this carve-out
+        the flag would fire on the busiest honest IPs first. The same reasoning
+        and the same threshold guard the promo gate.
+        """
+        p = self._ip[h]
+        recent = self.ip_failures_recent(h, now)
+        if recent < IP_FAIL_THRESHOLD:
+            return None
+        if len(p.accounts) > HIGH_POP_IP_ACCOUNTS:
+            return None
+        newly = p.suspicious_at is None
+        if newly:
+            p.suspicious_at = now
+            p.suspicious_reason = (
+                f"{recent} failed payment attempts within "
+                f"{int(IP_FAIL_WINDOW // 60)} minutes"
+            )
+        return {
+            # True only on the transition. Callers audit on `new` so an address
+            # that keeps failing does not write an audit entry per attempt --
+            # the attempts themselves are already recorded individually.
+            "new": newly,
+            "ip_hash": h,
+            "since": datetime.fromtimestamp(p.suspicious_at, tz=timezone.utc).isoformat(),
+            "reason": p.suspicious_reason,
+            "failures_in_window": recent,
+            "failures_total": p.n_fail,
+            "accounts": len(p.accounts),
+        }
+
+    def suspicious_ips(self) -> list[dict]:
+        out = []
+        for h, p in self._ip.items():
+            if p.suspicious_at is None:
+                continue
+            out.append({
+                "ip_hash": h,
+                "since": datetime.fromtimestamp(p.suspicious_at, tz=timezone.utc).isoformat(),
+                "reason": p.suspicious_reason,
+                "failures_total": p.n_fail,
+                "accounts": len(p.accounts),
+                "transactions": p.n_txn,
+            })
+        out.sort(key=lambda r: r["since"], reverse=True)
+        return out
 
 
 # DynamoDB mapping, for when the adapter is built
@@ -839,6 +1005,24 @@ class Scorer:
 # the bonus, and support can reverse it. So the thresholds are deliberately more
 # aggressive than anything acceptable at checkout.
 
+# ---------------------------------------------------------------------------
+# Unit costs -- CANONICAL. ml/cost_model.py imports these.
+# ---------------------------------------------------------------------------
+#
+# Defined here rather than in ml/ because the serving path needs them (for the
+# threshold tuner's cost curve) and ml/ is deliberately absent from the Docker
+# image. Same inversion as build_matrix: serving code is canonical.
+#
+# Industry-typical estimates for a mid-size Indian D2C merchant at an average
+# order value near Rs 2,400. NOT audited figures from a real merchant. The churn
+# term inside COST_BLOCK_LEGIT is the softest input -- see cost_model.sensitivity().
+COST_AOV = 2400.0
+COST_FRAUD = COST_AOV + 750.0 + 400.0          # goods + chargeback fee + handling
+COST_REVIEW = 35.0                             # analyst, ~3 min, loaded
+COST_BLOCK_LEGIT = COST_AOV * 0.12 + 5750.0 * 0.20   # lost margin + churn EV = 1438
+COST_PROMO_VALUE = 500.0
+COST_PROMO_WRONG_DENY = COST_PROMO_VALUE + 260.0
+
 PROMO_FEATURES = [
     "promo_redemptions_on_device",
     "promo_redemptions_on_ip",
@@ -1004,9 +1188,6 @@ def email_stem_similarity(email: str, others: list[str]) -> float:
 #     FRAUDSHIELD_USERS_BACKEND=dynamodb because enabling it creates and writes
 #     to a real AWS table, which costs money and should be a deliberate act.
 #   - the default in-memory store LOSES ALL USERS ON RESTART.
-
-import hashlib
-import hmac
 
 import jwt
 from argon2 import PasswordHasher
@@ -1322,11 +1503,21 @@ class DynamoRecordStore:
         return self._unclean(it) if it else None
 
     def query_prefix(self, pk: str, sk_prefix: str, desc: bool = True) -> list[dict]:
-        r = self._t.query(
-            KeyConditionExpression="PK = :p AND begins_with(SK, :s)",
-            ExpressionAttributeValues={":p": pk, ":s": sk_prefix},
-            ScanIndexForward=not desc,
-        )
+        # DynamoDB rejects begins_with("") -- a key attribute cannot be an empty
+        # string. An empty prefix means "everything under this partition", which
+        # is a plain PK query.
+        if sk_prefix:
+            r = self._t.query(
+                KeyConditionExpression="PK = :p AND begins_with(SK, :s)",
+                ExpressionAttributeValues={":p": pk, ":s": sk_prefix},
+                ScanIndexForward=not desc,
+            )
+        else:
+            r = self._t.query(
+                KeyConditionExpression="PK = :p",
+                ExpressionAttributeValues={":p": pk},
+                ScanIndexForward=not desc,
+            )
         return [self._unclean(i) for i in r.get("Items", [])]
 
     def update_fields(self, pk: str, sk: str, fields: dict) -> None:
@@ -1412,9 +1603,14 @@ def decode_access(token: str) -> dict:
 # =============================================================================
 
 STATE: dict = {
+    # Addresses that have produced at least one failed authorisation. Needed
+    # because neither record store supports a scan, so listing failed attempts
+    # requires knowing which IPFAIL# partitions exist. Bounded by distinct
+    # failing IPs, not by attempt count.
+    "fail_ips": set(),
     "store": None, "scorer": None, "queue": [], "txns": {},
     "users": None, "users_backend": "?", "records": None, "records_backend": "?",
-    "promo_queue": [],
+    "promo_queue": [], "audit": [],
 }
 
 
@@ -1453,20 +1649,47 @@ async def lifespan(_app: FastAPI):
     scorer = Scorer()
     users, backend_desc = make_user_store()
 
-    # Local-development convenience only. With the in-memory store there is no
-    # out-of-band way to create a staff account, so the console would be
-    # unreachable. Gated behind an explicit env var and prints a random password
-    # rather than shipping a known one.
+    # ---- staff account seeding -------------------------------------------
+    #
+    # There is no API path to a privileged role (self-service signup always makes
+    # a customer), so a staff account has to come from outside the API. This is
+    # that path.
+    #
+    # Credentials come from the environment, NOT from source. A password literal
+    # in a tracked file is one `git push` from being public, and this one grants
+    # threshold control over every future decision. .env is gitignored;
+    # .env.example holds placeholders only.
+    #
+    # If FRAUDSHIELD_ADMIN_PASSWORD is unset a random one is generated and
+    # printed, so the console is still reachable but nothing predictable exists.
     if os.environ.get("FRAUDSHIELD_DEV_SEED_STAFF") == "1":
-        pw = secrets.token_urlsafe(12)
-        seeded = User(
-            user_id=uuid.uuid4().hex, email="analyst@fraudshield.local",
-            password_hash=PWD.hash(pw), role="analyst",
-            created_at=datetime.now(timezone.utc).isoformat(),
-        )
-        if users.create(seeded):
-            print("\n  DEV SEED (never enable outside local development)")
-            print(f"    analyst@fraudshield.local  /  {pw}\n")
+        seeds = [
+            ("admin",
+             os.environ.get("FRAUDSHIELD_ADMIN_EMAIL", "admin@fraudshield.local"),
+             os.environ.get("FRAUDSHIELD_ADMIN_PASSWORD", "")),
+            ("analyst",
+             os.environ.get("FRAUDSHIELD_ANALYST_EMAIL", "analyst@fraudshield.local"),
+             os.environ.get("FRAUDSHIELD_ANALYST_PASSWORD", "")),
+        ]
+        banner: list[str] = []
+        for role, email, pw in seeds:
+            generated = not pw
+            if generated:
+                pw = secrets.token_urlsafe(12)
+            u = User(
+                user_id=uuid.uuid4().hex, email=_norm_email(email),
+                password_hash=PWD.hash(pw), role=role,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+            if users.create(u):
+                banner.append(f"    {role:<8} {email}  /  {pw}"
+                              + ("   (generated)" if generated else ""))
+            else:
+                banner.append(f"    {role:<8} {email}  /  (already exists, unchanged)")
+        if banner:
+            print("\n  STAFF SEED -- local development only. Set "
+                  "FRAUDSHIELD_DEV_SEED_STAFF=0 before exposing this service.")
+            print("\n".join(banner) + "\n")
 
     records, records_desc = make_record_store()
     STATE["store"] = store
@@ -1487,6 +1710,12 @@ async def lifespan(_app: FastAPI):
         print("WARNING: FRAUDSHIELD_JWT_SECRET is unset. Using an ephemeral secret: "
               "every restart invalidates all sessions, and multiple workers will "
               "reject each other's tokens.")
+    if _IP_PEPPER_EPHEMERAL:
+        print("WARNING: FRAUDSHIELD_IP_PEPPER is unset. Using an ephemeral pepper: "
+              "IP and card fingerprints change on every restart, so entity counters "
+              "and instrument-reuse detection reset with them.")
+    print(f"client ip: derived server-side, trusted proxies="
+          f"{sorted(TRUSTED_PROXIES) or 'none (using peer address)'}")
     yield
     STATE.clear()
 
@@ -1506,7 +1735,7 @@ app.add_middleware(
     # is explicit -- a wildcard with credentials is rejected by browsers, and
     # would be a serious hole if it were not.
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT"],
     allow_headers=["x-api-key", "content-type", "authorization"],
 )
 
@@ -1555,6 +1784,18 @@ def require_role(*allowed: str):
 
 
 class ScoreRequest(BaseModel):
+    """Service-to-service scoring, guarded by the shared API key.
+
+    This endpoint DOES accept `ip_hash` and `status` from the caller, unlike
+    /v1/orders. That is deliberate and it is the one legitimate case: a merchant's
+    own server relaying a checkout knows the end customer's address and the
+    gateway's authorisation result, and must pass both. The API key is what makes
+    that trustworthy.
+
+    Never expose this endpoint to a browser. A caller who can choose its own
+    ip_hash walks straight past ip_concentration and ring detection.
+    """
+
     customer_id: str
     amount: float = Field(gt=0)
     payment_method: str
@@ -1767,11 +2008,125 @@ def me(u: User = Depends(current_user)) -> PublicUser:
 # ---------------------------------------------------------------------------
 
 CATALOGUE = {
-    "p1": {"name": "Wireless earbuds", "price": 2499.0},
-    "p2": {"name": "Mechanical keyboard", "price": 6799.0},
-    "p3": {"name": "Smartphone", "price": 42999.0},
-    "p4": {"name": "Phone case", "price": 449.0},
+    "p1":  {"name": "Wireless earbuds", "price": 2499.0, "category": "Audio", "stock": 42},
+    "p2":  {"name": "Mechanical keyboard", "price": 6799.0, "category": "Peripherals", "stock": 18},
+    "p3":  {"name": "Smartphone 5G 128GB", "price": 42999.0, "category": "Phones", "stock": 7},
+    "p4":  {"name": "Silicone phone case", "price": 449.0, "category": "Accessories", "stock": 260},
+    "p5":  {"name": "Noise-cancelling headphones", "price": 12999.0, "category": "Audio", "stock": 23},
+    "p6":  {"name": "Smartwatch", "price": 8499.0, "category": "Wearables", "stock": 31},
+    "p7":  {"name": "65W USB-C charger", "price": 1899.0, "category": "Accessories", "stock": 140},
+    "p8":  {"name": "1TB portable SSD", "price": 7299.0, "category": "Storage", "stock": 26},
+    "p9":  {"name": "Laptop backpack", "price": 2199.0, "category": "Accessories", "stock": 88},
+    "p10": {"name": "27in 4K monitor", "price": 27499.0, "category": "Displays", "stock": 5},
+    "p11": {"name": "Wireless mouse", "price": 1299.0, "category": "Peripherals", "stock": 175},
+    "p12": {"name": "Tablet 11in", "price": 31999.0, "category": "Tablets", "stock": 9},
 }
+
+BANKS = {
+    "HDFC": "HDFC Bank", "ICIC": "ICICI Bank", "SBIN": "State Bank of India",
+    "AXIS": "Axis Bank", "KKBK": "Kotak Mahindra", "PUNB": "Punjab National Bank",
+}
+WALLETS = ["Paytm", "PhonePe", "Amazon Pay", "Mobikwik"]
+
+# Card BIN -> network, for display and for the `card_fingerprint` namespace. Only
+# the first digit is needed to name the network; we never keep more than that
+# plus the last four.
+CARD_NETWORKS = {"4": "Visa", "5": "Mastercard", "6": "RuPay", "3": "Amex"}
+
+
+def _luhn_ok(number: str) -> bool:
+    """Checksum used by every real card. Rejects typos before they reach a gateway."""
+    digits = [int(c) for c in number if c.isdigit()]
+    if len(digits) < 12:
+        return False
+    total = 0
+    for i, d in enumerate(reversed(digits)):
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def card_fingerprint(number: str) -> str:
+    """Stable, non-reversible identifier for a card.
+
+    HMAC with the server pepper, so two accounts using the same card produce the
+    same fingerprint (which is the fraud signal) while a table dump yields no PANs.
+    """
+    digits = "".join(c for c in number if c.isdigit())
+    mac = hmac.new(IP_PEPPER.encode(), digits.encode(), hashlib.sha256).hexdigest()
+    return f"card_{mac[:24]}"
+
+
+def validate_instrument(req: "OrderRequest") -> tuple[str, str]:
+    """Validate the method-specific payload. Returns (instrument_ref, display).
+
+    instrument_ref is what gets stored and counted. For cards that is the
+    fingerprint, never the number.
+    """
+    m = req.payment_method
+    if m == "card":
+        if req.card is None:
+            raise HTTPException(422, "Card details are required.")
+        digits = "".join(c for c in req.card.number if c.isdigit())
+        if not _luhn_ok(digits):
+            raise HTTPException(422, "That card number is not valid.")
+        if not req.card.cvv.isdigit():
+            raise HTTPException(422, "CVV must be numeric.")
+        now = datetime.now(timezone.utc)
+        if (req.card.expiry_year, req.card.expiry_month) < (now.year, now.month):
+            raise HTTPException(422, "That card has expired.")
+        network = CARD_NETWORKS.get(digits[0], "Card")
+        return card_fingerprint(digits), f"{network} \u2022\u2022\u2022\u2022 {digits[-4:]}"
+
+    if m == "upi":
+        if req.upi is None:
+            raise HTTPException(422, "A UPI ID is required.")
+        vpa = req.upi.vpa.strip().lower()
+        if not re.fullmatch(r"[a-z0-9._-]{3,}@[a-z]{2,}", vpa):
+            raise HTTPException(422, "Enter a UPI ID like name@bank.")
+        return f"upi_{vpa}", vpa
+
+    if m == "netbanking":
+        if req.netbanking is None or req.netbanking.bank_code.upper() not in BANKS:
+            raise HTTPException(422, "Choose a bank.")
+        code = req.netbanking.bank_code.upper()
+        return f"nb_{code}", BANKS[code]
+
+    if m == "wallet":
+        if req.wallet is None:
+            raise HTTPException(422, "Wallet details are required.")
+        phone = re.sub(r"\D", "", req.wallet.phone)
+        if len(phone) < 10:
+            raise HTTPException(422, "Enter a valid phone number.")
+        mac = hmac.new(IP_PEPPER.encode(), phone.encode(), hashlib.sha256).hexdigest()
+        return f"wal_{mac[:20]}", f"{req.wallet.provider} \u2022\u2022\u2022{phone[-4:]}"
+
+    return "cod", "Cash on delivery"
+
+
+def simulate_authorisation(method: str, amount: float, decision: str) -> str:
+    """Stand-in for a gateway response.
+
+    The point is that settlement status is decided SERVER-SIDE. It used to be a
+    request-body field, which let a caller declare its own outcome and poison the
+    velocity and failure-rate features -- the same class of bug as client-supplied
+    ip_hash.
+
+    A BLOCK never reaches a gateway. Otherwise we model a small background decline
+    rate, higher on cards, which is what produces the innocent failures the model
+    was trained to tolerate.
+    """
+    if decision == "BLOCK":
+        return "failed"
+    if method == "cod":
+        return "success"
+    base = {"card": 0.06, "netbanking": 0.05, "wallet": 0.03, "upi": 0.02}.get(method, 0.03)
+    if amount > 25000:
+        base += 0.03          # issuers decline high-value more often
+    return "failed" if secrets.randbelow(10000) / 10000.0 < base else "success"
 
 CUSTOMER_MESSAGE = {
     "ALLOW": ("confirmed", "Order confirmed."),
@@ -1784,11 +2139,74 @@ CUSTOMER_MESSAGE = {
 }
 
 
-class OrderRequest(BaseModel):
+def audit(actor: str, action: str, before: dict, after: dict) -> dict:
+    """Append an entry to the in-process log and the append-only audit item.
+
+    A persistence failure must not fail the operation being audited -- refusing a
+    threshold change because the log is unreachable would be worse than the gap.
+    The warning is printed instead, so the gap is at least visible.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    entry = {"actor": actor, "action": action,
+             "before": before, "after": after, "at": now}
+    STATE["audit"].append(entry)
+    try:
+        STATE["records"].put(f"AUDIT#{now[:10]}", f"{now}#{uuid.uuid4().hex[:8]}", entry)
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNING: audit write failed ({type(exc).__name__}); "
+              f"'{action}' applied but not persisted")
+    return entry
+
+
+class CartLine(BaseModel):
     product_id: str
+    qty: int = Field(default=1, ge=1, le=10)
+
+
+class CardDetails(BaseModel):
+    """Captured, fingerprinted, then discarded.
+
+    The PAN is NEVER stored, logged, or passed to the risk engine. Only a salted
+    fingerprint of it survives this request, which is enough to count instrument
+    reuse across accounts without holding card data. A real integration would let
+    the gateway tokenise client-side so the PAN never reaches this server at all.
+    """
+
+    number: str = Field(min_length=12, max_length=19)
+    expiry_month: int = Field(ge=1, le=12)
+    expiry_year: int = Field(ge=2024, le=2100)
+    cvv: str = Field(min_length=3, max_length=4)
+    holder: str = Field(default="", max_length=80)
+
+
+class UpiDetails(BaseModel):
+    vpa: str = Field(min_length=5, max_length=60)
+
+
+class NetbankingDetails(BaseModel):
+    bank_code: str = Field(min_length=2, max_length=12)
+
+
+class WalletDetails(BaseModel):
+    provider: str = Field(min_length=2, max_length=24)
+    phone: str = Field(min_length=10, max_length=13)
+
+
+class OrderRequest(BaseModel):
+    """`ip_hash` is deliberately absent. It is derived from the connection.
+
+    `device_fp` stays client-supplied because a browser fingerprint inherently is
+    — which is exactly why device signals must be corroborated by payout reuse or
+    velocity rather than trusted alone.
+    """
+
+    items: list[CartLine] = Field(min_length=1, max_length=20)
     payment_method: str = Field(pattern="^(upi|card|netbanking|wallet|cod)$")
     device_fp: str = Field(min_length=3, max_length=128)
-    ip_hash: str = Field(min_length=3, max_length=128)
+    card: CardDetails | None = None
+    upi: UpiDetails | None = None
+    netbanking: NetbankingDetails | None = None
+    wallet: WalletDetails | None = None
 
 
 class ReturnRequest(BaseModel):
@@ -1799,32 +2217,57 @@ class ReturnRequest(BaseModel):
 
 @app.get("/v1/catalog/products")
 def catalog() -> dict:
-    return {"products": [{"id": k, **v} for k, v in CATALOGUE.items()]}
+    return {
+        "products": [{"id": k, **v} for k, v in CATALOGUE.items()],
+        "payment_methods": [
+            {"code": "upi", "label": "UPI", "needs": "vpa"},
+            {"code": "card", "label": "Card", "needs": "card"},
+            {"code": "netbanking", "label": "Netbanking", "needs": "bank"},
+            {"code": "wallet", "label": "Wallet", "needs": "wallet"},
+            {"code": "cod", "label": "Cash on delivery", "needs": None},
+        ],
+        "banks": [{"code": k, "name": v} for k, v in BANKS.items()],
+        "wallets": WALLETS,
+    }
 
 
 @app.post("/v1/orders", status_code=201)
-def create_order(req: OrderRequest, u: User = Depends(current_user)) -> dict:
-    """Create an order, score it, persist it.
+def create_order(req: OrderRequest, request: Request,
+                 u: User = Depends(current_user)) -> dict:
+    """Create a multi-item order, score it, authorise it, persist it.
 
-    The response is role-dependent: a customer gets status and a message, staff
-    additionally get the risk breakdown. Enforced here rather than in the client,
-    because a customer who can read reason codes learns which signal to avoid.
+    Three inputs are deliberately NOT taken from the request body:
+      - ip_hash   derived from the connection (see ip_hash_of)
+      - amount    computed from the catalogue, never trusted from the client
+      - status    decided by simulate_authorisation, not declared by the caller
+
+    All three were previously client-controlled, and each one let a caller poison
+    the features the model depends on.
     """
-    product = CATALOGUE.get(req.product_id)
-    if product is None:
-        raise HTTPException(404, "Unknown product.")
+    lines = []
+    total = 0.0
+    for line in req.items:
+        p = CATALOGUE.get(line.product_id)
+        if p is None:
+            raise HTTPException(404, f"Unknown product {line.product_id}.")
+        if line.qty > p["stock"]:
+            raise HTTPException(409, f"{p['name']}: only {p['stock']} left.")
+        total += p["price"] * line.qty
+        lines.append({"product_id": line.product_id, "name": p["name"],
+                      "qty": line.qty, "unit_price": p["price"]})
+
+    instrument_ref, instrument_display = validate_instrument(req)
 
     store: InMemoryStore = STATE["store"]
     scorer: Scorer = STATE["scorer"]
     records = STATE["records"]
 
     ts = datetime.now(timezone.utc).timestamp()
-    # The scorer keys on customer_id, so the account IS the risk subject. Using
-    # anything client-supplied here would let a caller reset their own history.
+    ipa = ip_hash_of(request)
     txn = {
-        "customer_id": u.user_id, "ts": ts, "amount": product["price"],
+        "customer_id": u.user_id, "ts": ts, "amount": round(total, 2),
         "payment_method": req.payment_method, "device_fp": req.device_fp,
-        "ip_hash": req.ip_hash,
+        "ip_hash": ipa,
     }
 
     try:
@@ -1835,20 +2278,87 @@ def create_order(req: OrderRequest, u: User = Depends(current_user)) -> dict:
                          "error": type(exc).__name__},
         ) from exc
 
-    settled = "failed" if d.decision == "BLOCK" else "success"
+    settled = simulate_authorisation(req.payment_method, total, d.decision)
     # Read-before-write: features were read above; state is applied only now.
     dt = datetime.fromtimestamp(ts, tz=timezone.utc)
     store.commit({**txn, "status": settled, "hour": dt.hour + dt.minute / 60.0})
 
     order_id = f"ord_{uuid.uuid4().hex[:10]}"
     txn_id = f"pay_{uuid.uuid4().hex[:10]}"
-    status_key, message = CUSTOMER_MESSAGE[d.decision]
+
+    if settled == "failed" and d.decision != "BLOCK":
+        # An innocent decline, not a risk decision. Saying "we couldn't process
+        # this" is accurate; implying suspicion would be wrong.
+        status_key = "declined_by_bank"
+        message = ("Your bank declined this payment. Try another method or "
+                   "contact them.")
+    else:
+        status_key, message = CUSTOMER_MESSAGE[d.decision]
+
+    # ---- failed attempt: persist it, then reconsider the address -------------
+    #
+    # The attempt is stored whether or not it trips the threshold. A flag with no
+    # underlying records is unauditable -- an analyst asked "why is this IP
+    # flagged?" needs the individual declines, not just a count.
+    #
+    # Note what is NOT recorded: no card number, no CVV, no VPA. validate_instrument
+    # has already reduced the instrument to a salted fingerprint by this point, and
+    # a table of failed attempts is exactly the wrong place to hold raw PANs.
+    ip_flag: dict | None = None
+    if settled == "failed":
+        attempt_id = f"fail_{uuid.uuid4().hex[:10]}"
+        attempt = {
+            "attempt_id": attempt_id, "order_id": order_id,
+            "transaction_id": txn_id, "customer_id": u.user_id, "email": u.email,
+            "amount": round(total, 2), "payment_method": req.payment_method,
+            "instrument_display": instrument_display,
+            "instrument_ref": instrument_ref,
+            "device_fp": req.device_fp, "ip_hash": ipa,
+            "risk_score": d.risk_score, "decision": d.decision,
+            "customer_status": status_key, "created_at": dt.isoformat(),
+        }
+        records.put(f"IPFAIL#{ipa}", f"ATTEMPT#{dt.isoformat()}#{attempt_id}", attempt)
+        records.put(f"CUSTOMER#{u.user_id}", f"FAILED#{dt.isoformat()}#{attempt_id}",
+                    attempt)
+        STATE["fail_ips"].add(ipa)
+
+        ip_flag = store.evaluate_ip_suspicion(ipa, ts)
+        if ip_flag is not None:
+            # Mirrored into the record store so the mark survives a process
+            # restart even though the counters behind it do not.
+            records.put("SUSPICIOUS#IP", ipa, {
+                "ip_hash": ipa, "since": ip_flag["since"],
+                "reason": ip_flag["reason"],
+                "last_seen": dt.isoformat(),
+                "failures_total": ip_flag["failures_total"],
+                "accounts": ip_flag["accounts"],
+            })
+            if ip_flag["new"]:
+                audit(actor="system", action="ip_marked_suspicious",
+                      before={"ip_hash": ipa}, after=ip_flag)
+
+    # Instrument reuse across accounts is a strong signal, so it is counted the
+    # same way payout destinations are for the promo gate.
+    records.put(f"INSTRUMENT#{instrument_ref}", f"{dt.isoformat()}#{u.user_id}",
+                {"customer_id": u.user_id, "order_id": order_id})
+    instrument_accounts = {
+        r["customer_id"]
+        for r in records.query_prefix(f"INSTRUMENT#{instrument_ref}", "")
+    }
 
     record = {
         "order_id": order_id, "transaction_id": txn_id, "customer_id": u.user_id,
-        "email": u.email, "product_id": req.product_id,
-        "product_name": product["name"], "amount": product["price"],
-        "payment_method": req.payment_method, "created_at": dt.isoformat(),
+        "email": u.email, "items": lines, "item_count": sum(x["qty"] for x in lines),
+        "product_name": lines[0]["name"] + (f" +{len(lines) - 1} more" if len(lines) > 1 else ""),
+        "amount": round(total, 2), "payment_method": req.payment_method,
+        "instrument_display": instrument_display, "instrument_ref": instrument_ref,
+        "instrument_account_count": len(instrument_accounts),
+        # Stored so the analyst console can pivot from a transaction to its ring.
+        # Both are opaque: ip_hash is an HMAC, device_fp is a client-generated
+        # token. Neither is in the customer projection.
+        "device_fp": req.device_fp, "ip_hash": ipa,
+        "ip_suspicious": ip_flag is not None,
+        "settlement": settled, "created_at": dt.isoformat(),
         "customer_status": status_key, "risk_score": d.risk_score,
         "decision": d.decision, "sub_scores": d.sub_scores,
         "reason_codes": d.reason_codes, "fired_rules": d.fired_rules,
@@ -1863,12 +2373,21 @@ def create_order(req: OrderRequest, u: User = Depends(current_user)) -> dict:
         STATE["queue"].append(txn_id)
 
     out: dict = {"order_id": order_id, "status": status_key, "message": message,
-                 "product_name": product["name"], "amount": product["price"]}
+                 "items": lines, "amount": round(total, 2),
+                 "payment_method": req.payment_method,
+                 "instrument_display": instrument_display,
+                 # The customer is told the payment failed, because it did. They
+                 # are NOT told the address was flagged: naming the signal tells a
+                 # card tester exactly what to rotate next.
+                 "settlement": settled}
     if u.role in ("analyst", "admin"):
         out["risk"] = {
             "transaction_id": txn_id, "risk_score": d.risk_score,
             "decision": d.decision, "sub_scores": d.sub_scores,
             "reason_codes": d.reason_codes, "override": d.override,
+            "settlement": settled, "ip_hash": ipa,
+            "instrument_account_count": len(instrument_accounts),
+            "ip_suspicious": ip_flag,
         }
     return out
 
@@ -1878,7 +2397,9 @@ def _customer_order_view(r: dict, staff: bool) -> dict:
     to customers by default, so this enumerates what they may see."""
     view = {
         "order_id": r["order_id"], "product_name": r.get("product_name"),
+        "items": r.get("items", []), "item_count": r.get("item_count", 1),
         "amount": r.get("amount"), "payment_method": r.get("payment_method"),
+        "instrument_display": r.get("instrument_display"),
         "created_at": r.get("created_at"), "status": r.get("customer_status"),
         "return_status": r.get("return_status"),
     }
@@ -1886,6 +2407,8 @@ def _customer_order_view(r: dict, staff: bool) -> dict:
         view |= {
             "risk_score": r.get("risk_score"), "decision": r.get("decision"),
             "sub_scores": r.get("sub_scores"), "transaction_id": r.get("transaction_id"),
+            "settlement": r.get("settlement"),
+            "instrument_account_count": r.get("instrument_account_count"),
         }
     return view
 
@@ -1959,14 +2482,20 @@ PROMOS = {
 
 
 class RedeemRequest(BaseModel):
+    """`ip_hash` is absent on purpose -- derived from the connection.
+
+    Letting a caller choose it would break ip_burst_fast_signup outright and,
+    worse, let an abuser deliberately trigger the shared-IP exemption to suppress
+    the IP signals entirely.
+    """
+
     promo_code: str = Field(min_length=3, max_length=32)
     device_fp: str = Field(min_length=3, max_length=128)
-    ip_hash: str = Field(min_length=3, max_length=128)
     payout_ref: str = Field(min_length=3, max_length=128,
                             description="UPI id or bank ref receiving the cashback")
 
 
-def _promo_features(u: User, req: RedeemRequest) -> dict:
+def _promo_features(u: User, req: RedeemRequest, ip_hash: str) -> dict:
     """Build the 7 documented features from live state.
 
     Reads the same entity graph the transaction scorer uses (device and IP
@@ -1978,7 +2507,7 @@ def _promo_features(u: User, req: RedeemRequest) -> dict:
     code = req.promo_code.upper()
 
     dev_hits = records.query_prefix(f"PROMODEV#{req.device_fp}", f"{code}#")
-    ip_hits = records.query_prefix(f"PROMOIP#{req.ip_hash}", f"{code}#")
+    ip_hits = records.query_prefix(f"PROMOIP#{ip_hash}", f"{code}#")
     payout_hits = records.query_prefix(f"PAYOUT#{req.payout_ref}", f"{code}#")
 
     # Distinct accounts seen on this device, from the transaction entity graph
@@ -1988,7 +2517,7 @@ def _promo_features(u: User, req: RedeemRequest) -> dict:
     dev_accounts.add(u.user_id)
 
     component = set(dev_accounts)
-    ip_accounts = set(entity.ip_accounts(req.ip_hash)) | {
+    ip_accounts = set(entity.ip_accounts(ip_hash)) | {
         h["customer_id"] for h in ip_hits
     }
     component |= ip_accounts
@@ -2023,7 +2552,8 @@ def promo_offers() -> dict:
 
 
 @app.post("/v1/promo/redeem", status_code=201)
-def redeem_promo(req: RedeemRequest, u: User = Depends(current_user)) -> dict:
+def redeem_promo(req: RedeemRequest, request: Request,
+                 u: User = Depends(current_user)) -> dict:
     """Claim an offer. ALLOW credits it, HOLD queues it, DENY refuses it.
 
     A refused cashback is not a refused sale: the customer can still buy, and a
@@ -2039,7 +2569,8 @@ def redeem_promo(req: RedeemRequest, u: User = Depends(current_user)) -> dict:
     if records.query_prefix(f"CUSTOMER#{u.user_id}", f"PROMO#{code}#"):
         raise HTTPException(409, "You have already claimed this promotion.")
 
-    feats = _promo_features(u, req)
+    ipa = ip_hash_of(request)
+    feats = _promo_features(u, req, ipa)
     d = score_promo(feats)
 
     now = datetime.now(timezone.utc).isoformat()
@@ -2053,7 +2584,7 @@ def redeem_promo(req: RedeemRequest, u: User = Depends(current_user)) -> dict:
         "status": state, "decision": d.decision, "fired_rules": d.fired,
         "reasons": d.reasons, "features": feats,
         "shared_ip_exempt": d.shared_ip_exempt,
-        "device_fp": req.device_fp, "ip_hash": req.ip_hash,
+        "device_fp": req.device_fp, "ip_hash": ipa,
         "payout_ref": req.payout_ref, "override_by": None,
     }
     records.put(f"CUSTOMER#{u.user_id}", f"PROMO#{code}#{now}", record)
@@ -2065,7 +2596,7 @@ def redeem_promo(req: RedeemRequest, u: User = Depends(current_user)) -> dict:
     # see a clean slate every time.
     records.put(f"PROMODEV#{req.device_fp}", f"{code}#{now}#{u.user_id}",
                 {"customer_id": u.user_id, "redemption_id": rid})
-    records.put(f"PROMOIP#{req.ip_hash}", f"{code}#{now}#{u.user_id}",
+    records.put(f"PROMOIP#{ipa}", f"{code}#{now}#{u.user_id}",
                 {"customer_id": u.user_id, "redemption_id": rid})
     if d.decision != "DENY":
         # Only a credited or pending payout occupies the destination. A denied
@@ -2104,6 +2635,232 @@ def my_promos(u: User = Depends(current_user)) -> dict:
          "value": r["value"], "status": r["status"], "created_at": r["created_at"]}
         for r in rows
     ]}
+
+
+class ThresholdUpdate(BaseModel):
+    review: float = Field(ge=0, le=100)
+    block: float = Field(ge=0, le=100)
+
+
+@app.get("/v1/admin/thresholds",
+         dependencies=[Depends(require_role("analyst", "admin"))])
+def get_thresholds() -> dict:
+    """Current cut-offs, the measured cost curve, and their effect on live traffic.
+
+    The review threshold is an OPERATIONS parameter, not a model property: at a
+    100:1 cost ratio between a missed fraud and a review, expected-cost
+    minimisation always wants to review more, so the binding constraint is how
+    many analysts you employ. That is why this is a control surface rather than a
+    constant baked into the model.
+    """
+    s: Scorer = STATE["scorer"]
+
+    sweep: list[dict] = []
+    mp = ARTIFACTS / "metrics.json"
+    if mp.exists():
+        try:
+            m = json.loads(mp.read_text())
+            sweep = m.get("threshold_sweep") or m.get("threshold_sweep_top10") or []
+        except (json.JSONDecodeError, OSError):
+            sweep = []
+
+    # What the current queue would look like at other cut-offs. Small sample, but
+    # it is this merchant's actual traffic rather than the evaluation split.
+    scored = [r for r in STATE["txns"].values() if r.get("risk_score") is not None]
+    live = []
+    for rt in (2, 5, 10, 20, 30, 40, 50, 60, 70):
+        for bt in (60, 70, 80, 90):
+            if bt <= rt:
+                continue
+            n_block = sum(1 for r in scored if r["risk_score"] >= bt)
+            n_review = sum(1 for r in scored if rt <= r["risk_score"] < bt)
+            live.append({"review": rt, "block": bt, "would_block": n_block,
+                         "would_review": n_review,
+                         "review_share": round(n_review / len(scored), 4) if scored else 0})
+
+    return {
+        "current": {"review": s.review_t, "block": s.block_t},
+        "source": "runtime (env defaults FRAUDSHIELD_REVIEW_T / _BLOCK_T)",
+        "cost_curve": sweep,
+        "cost_curve_note": (
+            "Expected rupee cost on the VALIDATION split. Costs assume "
+            f"Rs {COST_FRAUD:.0f} per missed fraud, Rs {COST_REVIEW:.0f} per review, "
+            f"Rs {COST_BLOCK_LEGIT:.0f} per wrongly blocked customer."
+        ),
+        "live_projection": live,
+        "live_sample_size": len(scored),
+        "caveat": (
+            "Changing thresholds does NOT re-decide transactions already scored. "
+            "It applies to new traffic only, and the queue is not recomputed."
+        ),
+    }
+
+
+@app.put("/v1/admin/thresholds",
+         dependencies=[Depends(require_role("admin"))])
+def put_thresholds(req: ThresholdUpdate,
+                   actor: User = Depends(require_role("admin"))) -> dict:
+    """Move the cut-offs at runtime. Admin only, and audited.
+
+    Restricted to `admin` rather than `analyst`: an analyst decides individual
+    cases, but moving a threshold silently changes every future decision and the
+    merchant's whole false-positive exposure. Different blast radius, different
+    permission.
+    """
+    if req.block <= req.review:
+        raise HTTPException(422, "Block threshold must be above the review threshold.")
+
+    s: Scorer = STATE["scorer"]
+    before = {"review": s.review_t, "block": s.block_t}
+    s.review_t = float(req.review)
+    s.block_t = float(req.block)
+    after = {"review": s.review_t, "block": s.block_t}
+
+    # Append-only. A threshold change that leaves no trace makes every later
+    # "why was this blocked?" unanswerable.
+    entry = audit(actor.email, "threshold_update", before, after)
+    now = entry["at"]
+
+    return {
+        "current": after, "previous": before, "actor": actor.email, "at": now,
+        "note": "Applies to new traffic only. Already-scored transactions keep "
+                "their original decision.",
+    }
+
+
+@app.get("/v1/admin/audit", dependencies=[Depends(require_role("admin"))])
+def audit_log(limit: int = 50) -> dict:
+    day = datetime.now(timezone.utc).isoformat()[:10]
+    persisted: list[dict] = []
+    try:
+        persisted = STATE["records"].query_prefix(f"AUDIT#{day}", "")
+    except Exception:  # noqa: BLE001
+        pass
+    rows = persisted or list(reversed(STATE["audit"]))
+    return {"count": len(rows), "entries": rows[:limit]}
+
+
+@app.get("/v1/admin/rings/{entity_type}/{entity_id}",
+         dependencies=[Depends(require_role("analyst", "admin"))])
+def ring_graph(entity_type: str, entity_id: str, depth: int = 2) -> dict:
+    """Expand the shared-entity component around a device, IP or account.
+
+    Returns nodes and edges for the analyst console's graph view. Same adjacency
+    the network score walks -- so the picture and the number cannot disagree.
+
+    Bounded at MAX_COMPONENT. A carrier CGNAT range or campus network can reach
+    thousands of accounts, and an unbounded walk would both time out and produce a
+    component with no meaning.
+    """
+    if entity_type not in ("device", "ip", "account"):
+        raise HTTPException(422, "entity_type must be device, ip or account.")
+    depth = max(1, min(3, depth))
+
+    store: InMemoryStore = STATE["store"]
+    accounts: set[str] = set()
+    if entity_type == "device":
+        accounts |= set(store.device_accounts(entity_id))
+    elif entity_type == "ip":
+        accounts |= set(store.ip_accounts(entity_id))
+    else:
+        accounts.add(entity_id)
+
+    devices: set[str] = set()
+    ips: set[str] = set()
+    truncated = False
+
+    # Breadth-first: accounts -> their devices and IPs -> accounts on those.
+    for _ in range(depth):
+        for a in list(accounts):
+            devices |= set(store.acct_devices[a])
+            ips |= set(store.acct_ips[a])
+        grew = set()
+        for d in devices:
+            grew |= set(store.device_accounts(d))
+        for p in ips:
+            # Skip high-population infrastructure. Following a carrier IP pulls in
+            # unrelated strangers and drowns the actual cluster.
+            if len(store.ip_accounts(p)) <= HIGH_POP_IP_ACCOUNTS:
+                grew |= set(store.ip_accounts(p))
+        if len(accounts | grew) > MAX_COMPONENT:
+            truncated = True
+            grew = set(list(grew)[: max(0, MAX_COMPONENT - len(accounts))])
+        if grew <= accounts:
+            break
+        accounts |= grew
+
+    users: UserStore = STATE["users"]
+    nodes, edges = [], []
+
+    for a in accounts:
+        n, f = store.account_totals(a)
+        u = users.get(a) if users else None
+        nodes.append({
+            "id": a, "type": "account",
+            "label": (u.email if u else a)[:38],
+            "txn_count": n, "fail_count": f,
+            "active_24h": store.account_activity_24h(a, time.time()),
+            "is_seed": entity_type == "account" and a == entity_id,
+        })
+    for d in devices:
+        shared = len(store.device_accounts(d))
+        nodes.append({"id": d, "type": "device", "label": d[:26],
+                      "account_count": shared,
+                      "is_seed": entity_type == "device" and d == entity_id,
+                      "suspicious": shared > 4})
+    for p in ips:
+        shared = len(store.ip_accounts(p))
+        nodes.append({"id": p, "type": "ip", "label": p[:26],
+                      "account_count": shared,
+                      "is_seed": entity_type == "ip" and p == entity_id,
+                      "shared_infra": shared > HIGH_POP_IP_ACCOUNTS,
+                      "suspicious": 6 < shared <= HIGH_POP_IP_ACCOUNTS})
+
+    node_ids = {n["id"] for n in nodes}
+    for a in accounts:
+        for d in store.acct_devices[a]:
+            if d in node_ids:
+                edges.append({"source": a, "target": d, "kind": "device"})
+        for p in store.acct_ips[a]:
+            if p in node_ids:
+                edges.append({"source": a, "target": p, "kind": "ip"})
+
+    return {
+        "seed": {"type": entity_type, "id": entity_id},
+        "depth": depth,
+        "truncated": truncated,
+        "counts": {"accounts": len(accounts), "devices": len(devices),
+                   "ips": len(ips), "edges": len(edges)},
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
+@app.get("/v1/admin/metrics",
+         dependencies=[Depends(require_role("analyst", "admin"))])
+def admin_metrics() -> dict:
+    """Serve the evaluation artifacts.
+
+    The dashboard reads these rather than hardcoding numbers, so a retrain shows
+    up in the UI instead of quietly making the interface lie.
+    """
+    def load(name: str) -> dict | None:
+        p = ARTIFACTS / name
+        if not p.exists():
+            return None
+        try:
+            return json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    txn = load("metrics.json")
+    promo = load("promo_metrics.json")
+    return {
+        "transaction": txn,
+        "promo": promo,
+        "missing": [n for n, v in (("metrics.json", txn),
+                                   ("promo_metrics.json", promo)) if v is None],
+    }
 
 
 @app.get("/v1/admin/promo-holds",
@@ -2148,6 +2905,82 @@ def promo_override(rid: str, actor: User = Depends(require_role("analyst", "admi
         STATE["promo_queue"].remove(rid)
     return {"redemption_id": rid, "status": "credited",
             "note": "override recorded as a false-positive label for this gate"}
+
+
+@app.get("/v1/admin/suspicious-ips",
+         dependencies=[Depends(require_role("analyst", "admin"))])
+def suspicious_ips(limit: int = 50) -> dict:
+    """Addresses flagged for a burst of failed payments, newest first.
+
+    Two sources, deliberately merged rather than picked between:
+
+      - live counters in the store, which have the exact trailing window but die
+        with the process
+      - SUSPICIOUS#IP records, which survive a restart but carry no window
+
+    After a restart the store is empty and only the records remain, so reading
+    just the counters would silently report zero flags on a system that has them.
+    """
+    store: InMemoryStore = STATE["store"]
+    records = STATE["records"]
+
+    live = {r["ip_hash"]: {**r, "source": "live"} for r in store.suspicious_ips()}
+
+    try:
+        for r in records.query_prefix("SUSPICIOUS#IP", ""):
+            h = r.get("ip_hash")
+            if h and h not in live:
+                live[h] = {
+                    "ip_hash": h, "since": r.get("since"),
+                    "reason": r.get("reason"),
+                    "failures_total": int(r.get("failures_total", 0)),
+                    "accounts": int(r.get("accounts", 0)),
+                    "transactions": 0, "source": "persisted",
+                }
+    except Exception:  # noqa: BLE001
+        pass
+
+    items = sorted(live.values(), key=lambda r: r.get("since") or "", reverse=True)
+
+    # Attach the individual declines. The count is the trigger; these are the
+    # evidence, and a flag an analyst cannot drill into is not actionable.
+    for it in items[:limit]:
+        try:
+            rows = records.query_prefix(f"IPFAIL#{it['ip_hash']}", "ATTEMPT#")
+        except Exception:  # noqa: BLE001
+            rows = []
+        it["attempts"] = [
+            {k: v for k, v in r.items() if k not in ("PK", "SK")} for r in rows[:10]
+        ]
+        it["attempt_count"] = len(rows)
+        it["accounts_involved"] = sorted({r.get("email", "") for r in rows} - {""})
+
+    return {"count": len(items), "threshold": IP_FAIL_THRESHOLD,
+            "window_minutes": int(IP_FAIL_WINDOW // 60),
+            "items": items[:limit]}
+
+
+@app.get("/v1/admin/failed-attempts",
+         dependencies=[Depends(require_role("analyst", "admin"))])
+def failed_attempts(limit: int = 100) -> dict:
+    """Every stored failed authorisation, newest first, across all addresses."""
+    store: InMemoryStore = STATE["store"]
+    records = STATE["records"]
+    flagged = {r["ip_hash"] for r in store.suspicious_ips()}
+
+    rows: list[dict] = []
+    for ipa in STATE["fail_ips"]:
+        try:
+            rows.extend(records.query_prefix(f"IPFAIL#{ipa}", "ATTEMPT#"))
+        except Exception:  # noqa: BLE001
+            continue
+
+    rows.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    return {"count": len(rows), "items": [
+        {**{k: v for k, v in r.items() if k not in ("PK", "SK")},
+         "ip_suspicious": r.get("ip_hash") in flagged}
+        for r in rows[:limit]
+    ]}
 
 
 @app.get("/v1/returns")
