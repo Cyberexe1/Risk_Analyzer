@@ -87,10 +87,12 @@ Legend: ✅ COMPLETED · 🟡 PARTIAL · 🔴 NOT IMPLEMENTED · ⚪ UNVERIFIED
 | Transaction store | 🔴 | `STATE["txns"]`, `STATE["queue"]` are process memory | Lost on restart |
 | Merchant dashboard | ✅ | 6-tab analyst console, React 18 | — |
 | Customer storefront | ✅ | Shop, cart, payment sheet, orders, offers, dashboard | — |
-| **Razorpay integration** | 🔴 | **No references found anywhere in the repository** | SDK, webhooks, signature verification, order creation |
-| Webhook ingestion | 🔴 | No webhook route exists | Entire ingestion path |
+| Webhook ingestion path | ✅ | `POST /v1/webhooks/payment`; provider event shape, paise conversion, method mapping | — |
+| Webhook signature verification | ✅ | HMAC-SHA256 over raw body, `hmac.compare_digest`; 6 tests incl. forgery and tampering | — |
+| Webhook replay protection | ✅ | `STATE["webhook_seen"]` + persisted `WEBHOOK#EVENT`; staleness window | — |
+| **Razorpay account integration** | 🔴 | **No Razorpay SDK, no account, no outbound call to Razorpay** | Test-mode keys, order creation, payment fetch |
 | LLM explanations | 🔴 | No LLM dependency or call site | — |
-| Automated test suite | 🟡 | 2 pytest tests, both parity; both pass | API, auth, rules, network, frontend tests |
+| Automated test suite | 🟡 | 24 pytest tests (2 parity + 22 webhook); all pass | API, auth, rules, network, frontend tests; no CI |
 | Containerisation | 🟡 | `Dockerfile` (serving only, non-root, healthcheck) | No compose, no frontend image |
 | CI/CD | 🔴 | No `.github/`, no pipeline config | — |
 | Secret hygiene | ✅ | `.env` gitignored and untracked; `.env.example` blanks all secrets | — |
@@ -103,6 +105,11 @@ Legend: ✅ COMPLETED · 🟡 PARTIAL · 🔴 NOT IMPLEMENTED · ⚪ UNVERIFIED
 
 ```mermaid
 flowchart TD
+    W["Signed payment events<br/>scripts/emit_webhook.py"] -->|"POST /v1/webhooks/payment"| WV["HMAC-SHA256 verify<br/>raw body, compare_digest"]
+    WV -->|"401 if forged"| WX["Rejected"]
+    WV --> WI["Replay + staleness check<br/>WEBHOOK#EVENT"]
+    WI --> D
+
     A["Customer storefront<br/>React 18 + Vite"] -->|"POST /v1/orders"| B["FastAPI backend.py"]
     B --> C["Instrument validation<br/>Luhn + salted fingerprint"]
     C --> D["build_online_features<br/>22 features from live state"]
@@ -141,27 +148,33 @@ flowchart TD
     style O fill:#963e2d,color:#fff
     style N fill:#b38b3f,color:#fff
     style M fill:#3d5a45,color:#fff
+    style WX fill:#963e2d,color:#fff
 ```
+
+The webhook branch is the ingestion contract described in §15: verification, replay protection and scoring are real; the **sender** is a local emitter, not Razorpay.
 
 ### Target Architecture — What Remains
 
 ```mermaid
 flowchart TD
-    A["Razorpay Test Mode"] -.->|"NOT BUILT"| B["Webhook ingestion<br/>+ signature verification"]
-    B -.->|"NOT BUILT"| C["Durable transaction store<br/>DynamoDB + 3 GSIs"]
-    C -.-> D["Existing scoring pipeline<br/>ALREADY BUILT"]
-    D -.->|"NOT BUILT"| E["Per-decision audit row"]
-    D -.->|"PARTIAL"| F["Persisted thresholds"]
-    D -.->|"NOT BUILT"| G["Bounded automated actions"]
-    E -.->|"NOT BUILT"| H["CI pipeline"]
+    A["Razorpay Test Mode account<br/>NOT BUILT - needs a business account"] -.->|"swap the sender"| B["Webhook ingestion + verification<br/>ALREADY BUILT"]
+    A -.->|"NOT BUILT"| A2["Razorpay SDK: order creation,<br/>payment fetch, refunds"]
+    B --> C2["Existing scoring pipeline<br/>ALREADY BUILT"]
+    C2 -.->|"NOT BUILT"| C["Durable transaction store<br/>DynamoDB + 3 GSIs"]
+    C2 -.->|"NOT BUILT"| E["Per-decision audit row<br/>for storefront orders"]
+    C2 -.->|"PARTIAL"| F["Persisted thresholds"]
+    C2 -.->|"NOT BUILT"| G["Bounded automated actions<br/>escalation tier, action limits"]
+    C2 -.->|"NOT BUILT"| H["CI pipeline"]
 
     style A stroke-dasharray: 5 5
-    style B stroke-dasharray: 5 5
+    style A2 stroke-dasharray: 5 5
     style C stroke-dasharray: 5 5
     style E stroke-dasharray: 5 5
     style G stroke-dasharray: 5 5
     style H stroke-dasharray: 5 5
 ```
+
+Note the direction of the remaining work on the provider: the receiving side exists, so a real account swaps the *sender* rather than adding a new layer.
 
 ---
 
@@ -402,28 +415,85 @@ Thresholds default to 5 and 70, are overridable by `FRAUDSHIELD_REVIEW_T` / `FRA
 
 ---
 
-## 15. Razorpay Integration
+## 15. Payment Provider Integration
 
-**🔴 NOT IMPLEMENTED.**
+**� PARTIAL — the ingestion contract is real and tested; the provider is simulated.**
 
-This is the clearest gap between the specification and the repository. Exhaustive search across all tracked files returned zero matches:
+Razorpay Test Mode requires a business account, which this project does not have. Rather than fake an integration or skip it, the **ingestion contract** is implemented against Razorpay's documented webhook shape and signature scheme, with a local emitter standing in for the provider's sender.
 
-| Search term | Matches |
+Being precise about the boundary matters more here than anywhere else in this document.
+
+### What is genuinely implemented and tested
+
+| Capability | Evidence |
 |---|---|
-| `razorpay` | **0** |
-| `rzp_` | **0** |
-| `webhook` | **0** |
-| `hmac_sha256` | **0** |
-| `X-Razorpay` | **0** |
+| Webhook endpoint | `POST /v1/webhooks/payment` (`backend.py` §12) |
+| **HMAC-SHA256 signature verification** | `verify_webhook_signature()` — digest over the **raw request body**, compared with `hmac.compare_digest` |
+| Forged signature rejected | 401. Tested: wrong signature, wrong secret, absent, empty, and tampered body with a valid original signature |
+| Fail-closed when unconfigured | 503 if `FRAUDSHIELD_WEBHOOK_SECRET` is unset — never accepts unverified events |
+| Replay / idempotency | Event id checked against memory + persisted `WEBHOOK#EVENT`; tested that a redelivery does not double-count velocity |
+| Staleness window | Events older than `WEBHOOK_MAX_AGE_S` (24h) rejected |
+| Provider event shape | `payment.captured` / `payment.failed`, `payload.payment.entity`, `notes` |
+| Paise → rupee conversion | `amount` arrives in paise; tested that 249900 becomes ₹2,499.00 |
+| Method mapping | `emi` and `cardless_emi` → `card`, `cash` → `cod`, so no event is silently dropped |
+| Customer resolution | Payer email matched to an account, else a **stable** pepper-derived pseudo-id |
+| Scoring and persistence | Same `Scorer`, same record shapes, lands in the review queue |
+| Failed-attempt + IP flagging | A decline burst arriving by webhook flags the address exactly as one at checkout does |
+| Audit | Every ingestion writes `payment_event_ingested` |
 
-- No Razorpay SDK in `requirements-serve.txt`, `requirements-dev.txt`, or `pyproject.toml`
-- No webhook endpoint among the 29 routes
-- No signature verification, no order creation, no payment retrieval, no test-mode configuration
-- No Razorpay environment variables in `.env.example`
+Two implementation details that are load-bearing, both documented in the code:
 
-**What exists instead.** `simulate_authorisation(method, amount, decision)` in `backend.py` is an explicitly-labelled stand-in that returns `"success"` or `"failed"` using per-method base decline rates (card 6%, netbanking 5%, wallet 3%, UPI 2%, +3% above ₹25,000) and always fails a BLOCK decision. Card numbers are Luhn-validated and fingerprinted locally. No network call leaves the process.
+- The digest is computed over the **exact bytes received**, not a re-serialised copy of the parsed JSON. Re-serialising changes key order and spacing, the signature stops matching, and the usual "fix" is to stop verifying.
+- `hmac.compare_digest`, not `==`. A short-circuiting comparison leaks how many leading bytes matched, which is enough to forge a signature byte by byte.
 
-The scoring pipeline is **transport-agnostic** — it consumes a transaction dict — so wiring a webhook in front of it is genuinely additive work rather than a rewrite. But as of today there is no payment-provider integration of any kind.
+### What is NOT implemented
+
+| Missing | Consequence |
+|---|---|
+| Razorpay account and test-mode keys | No `rzp_test_` credentials exist |
+| Razorpay SDK | Not in any requirements file |
+| Any outbound call to Razorpay | No order creation, no payment fetch, no refund API |
+| Verification against Razorpay's real signatures | Only verified against our own emitter's |
+
+**So: this is not "Razorpay integration works."** There is no Razorpay account and nothing in this repository talks to Razorpay. What exists is the receiving half of the contract, with the security-critical part — proving a public unauthenticated endpoint is really being called by the provider — genuinely built and tested. Pointing it at Razorpay is a secret and a URL.
+
+### The simulator
+
+`scripts/emit_webhook.py` signs payloads with the shared secret and posts them:
+
+```bash
+python scripts/emit_webhook.py                  # one successful payment
+python scripts/emit_webhook.py --status failed  # one decline
+python scripts/emit_webhook.py --burst 4        # card-testing burst, flags the IP
+python scripts/emit_webhook.py --forge          # expect 401
+python scripts/emit_webhook.py --replay         # expect the second to dedupe
+python scripts/emit_webhook.py --demo           # all of the above in sequence
+```
+
+Verified output from a live `--demo` run:
+
+```
+1. valid signature, successful payment
+  HTTP 200  accepted          score 2.8 -> ALLOW  pay_35406b3bb5
+2. forged signature -- must be refused
+  HTTP 401  forged            Invalid webhook signature.
+3. replay of a valid event -- must be deduplicated
+  HTTP 200  first delivery    score 2.9 -> ALLOW  pay_136fcdf904
+  HTTP 200  redelivery        DUPLICATE -- replay refused, nothing scored
+4. card-testing burst from one address (ip_sim_8ff7f326)
+  HTTP 200  decline 1         score 41.5 -> MANUAL_REVIEW  pay_0819450846
+  HTTP 200  decline 2         score 73.9 -> BLOCK  pay_2b39f1d4cf
+  HTTP 200  decline 3         score 74.3 -> BLOCK  pay_91338fba56
+  HTTP 200  decline 4         score 74.6 -> BLOCK  pay_66497a438c
+```
+
+The escalation is the engine responding in real time: velocity and failure features accumulate across the burst, and the address is flagged at the third decline.
+
+### One honest modelling limitation
+
+A webhook arrives from the **provider's servers**, not the payer's browser, so `device_fp` and `ip_hash` cannot be derived from the connection. The merchant must forward them in `notes` at order-creation time. When absent, the record is marked `signals_complete: false` and sentinel values keep the transaction out of real clusters rather than joining an arbitrary one — device and IP signals are *unavailable* for that transaction rather than wrong.
+
+**What still exists for the storefront path.** `simulate_authorisation(method, amount, decision)` remains the stand-in gateway for orders placed through `/v1/orders`, using per-method decline rates (card 6%, netbanking 5%, wallet 3%, UPI 2%, +3% above ₹25,000) and always failing a BLOCK.
 
 ---
 
@@ -479,13 +549,19 @@ The scoring pipeline is **transport-agnostic** — it consumes a transaction dic
 | GET | `/v1/admin/suspicious-ips` | Flagged addresses + evidence | analyst, admin | ✅ |
 | GET | `/v1/admin/failed-attempts` | All stored declines | analyst, admin | ✅ |
 
+### Ingestion
+
+| Method | Endpoint | Purpose | Guard | Status |
+|---|---|---|---|---|
+| POST | `/v1/webhooks/payment` | Ingest a signed payment event, score and persist it | **HMAC signature** | ✅ |
+
+Public and unauthenticated by design — a provider has no session and no API key, so the signature *is* the authentication. That is why a missing or wrong signature returns 401 rather than 400, and why the endpoint returns 503 rather than accepting anything when no secret is configured. Accepts `X-Razorpay-Signature` or `X-Webhook-Signature`.
+
 ### Operations
 
 | Method | Endpoint | Purpose | Guard | Status |
 |---|---|---|---|---|
 | GET | `/health` | Model version, thresholds, store backends | public | ✅ |
-
-**No webhook endpoint exists.**
 
 ---
 
@@ -512,6 +588,7 @@ Single-table design, DynamoDB-shaped (`PK` + `SK`). Two interchangeable implemen
 | `CUSTOMER#<id>` | `FAILED#<iso>#<id>` | Failed payment attempt | ✅ |
 | `IPFAIL#<ip>` | `ATTEMPT#<iso>#<id>` | Failed attempt by address | ✅ |
 | `SUSPICIOUS#IP` | `<ip_hash>` | Flagged address | ✅ |
+| `WEBHOOK#EVENT` | `<event_id>` | Ingested provider event; replay protection across restarts | ✅ |
 | `AUDIT#<date>` | `<iso>#<uuid>` | Audit entry | 🟡 partial coverage |
 
 ### In process memory only — lost on restart
@@ -712,11 +789,22 @@ The repository notes that net saving survives this range but the optimal block t
 
 ### Not implemented
 
+**Webhook failures.** Four distinct paths, all tested:
+
+| Condition | Response | Why |
+|---|---|---|
+| Secret unset | 503 | Fail closed. An unverified webhook lets anyone who finds the URL inject transactions |
+| Bad/absent signature | 401 | Does not reveal whether it was absent, malformed or merely wrong |
+| Redelivery | 200, `duplicate: true` | Scoring twice would double every velocity counter it touches |
+| Scoring raises | 503 | Provider retries; idempotency is recorded *after* success so the retry is scored, not discarded |
+| Unmodelled event type | 200, not ingested | A non-2xx would earn an indefinite provider retry loop |
+
+### Not implemented
+
 | Scenario | Status |
 |---|---|
 | ML inference timeout | 🔴 No timeout wrapper — inference is synchronous and in-process |
-| Razorpay API failure | 🔴 No integration to fail |
-| Webhook failure / replay | 🔴 No webhook |
+| Razorpay API failure | 🔴 No outbound Razorpay calls exist to fail |
 | LLM failure | ⚪ Not applicable — no LLM |
 | `MODEL_FALLBACK_TRIGGERED` audit event | 🔴 Degradation is reported by `/health` but not written as an audit event |
 
@@ -745,12 +833,13 @@ The spec's demo script — *ML unavailable → fallback rules → manual review 
 | Fallback status | 🟡 | `degraded` on the Decision object and `/health`, but never audited |
 | Outcome | ✅ | `label` set by `POST /v1/admin/transactions/{id}/outcome` |
 
-### Audited events — only two
+### Audited events — three
 
 1. `threshold_update` — actor, before, after
 2. `ip_marked_suspicious` — fires once on transition, not on every subsequent failure
+3. `payment_event_ingested` — provider event id, payment id, resulting decision, score, settlement, customer resolution, and whether device/IP signals were complete
 
-**The significant gap:** there is **no per-decision audit row**. Every scored transaction stores its score, rules, reasons and decision on the order record, which is most of what an audit trail needs — but scoring a transaction does not itself emit an audit event. Analyst outcome decisions update the record without writing an audit entry either.
+**The remaining gap:** webhook-ingested decisions are now audited, but **storefront orders still are not**. A transaction created through `/v1/orders` stores its score, rules, reasons and decision on the order record — most of what an audit trail needs — yet scoring it emits no audit event. Analyst outcome decisions update the record without writing one either. One `audit()` call in `create_order` would close this.
 
 ---
 
@@ -826,8 +915,12 @@ Roughly two minutes total on a laptop. The dataset CSV is gitignored; the artifa
 
 ```bash
 copy .env.example .env          # then fill in the blank values
-uvicorn backend:app --port 8000 --forwarded-allow-ips=""
+python -m uvicorn backend:app --port 8000 --forwarded-allow-ips=""
 ```
+
+**Use `python -m uvicorn`, not bare `uvicorn`.** On a machine with more than one Python installation, `uvicorn.exe` on PATH may belong to a different interpreter than the one `pip` installed into, producing `ModuleNotFoundError: No module named 'pandas'` even though the install succeeded. `python -m uvicorn` guarantees the server runs on the interpreter that has the dependencies. Check with `python -c "import sys; print(sys.executable)"`.
+
+`.env` is loaded automatically at import time by `_load_dotenv()` in `backend.py` — no `python-dotenv` dependency. Variables already present in the real environment take precedence, and a missing file is a no-op, so containers that inject config directly are unaffected. Startup prints how many variables were loaded.
 
 `--forwarded-allow-ips=""` is **required, not cosmetic.** Without it uvicorn rewrites `request.client.host` from `X-Forwarded-For` for any loopback caller, which lets a request choose its own IP and walk past `ip_concentration`, ring detection, and the promo gate's IP signals.
 
@@ -856,13 +949,26 @@ python scripts/create_table.py            # create
 
 Then set `FRAUDSHIELD_USERS_BACKEND=dynamodb`. This creates a billable AWS resource.
 
+### Demo the webhook ingestion path
+
+Set `FRAUDSHIELD_WEBHOOK_SECRET` in `.env` (any high-entropy value — generate one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`), restart the backend, then:
+
+```bash
+python scripts/emit_webhook.py --demo
+```
+
+That runs the full sequence: a valid signed event is accepted and scored, a forged signature is refused with 401, a redelivery is deduplicated, and a four-decline burst from one address escalates the score and flags the IP. Then open the console's **Suspicious IPs** tab to see it.
+
 ### Tests
 
 ```bash
-python -m pytest                      # 2 tests
-python tests/test_parity.py           # also runnable standalone
+python -m pytest                      # 24 tests
+python -m pytest tests/test_webhook.py -v    # 22 webhook tests
+python tests/test_parity.py           # parity suites also run standalone
 python tests/test_score_parity.py
 ```
+
+The two parity suites take several minutes — they replay 99,419 transactions and compare 2.19M feature values. Worth knowing before running them under time pressure. The webhook suite finishes in seconds.
 
 ### Docker (serving only)
 
@@ -901,6 +1007,7 @@ Names only. No values.
 | `FRAUDSHIELD_ADMIN_PASSWORD` | Seeded admin password |
 | `FRAUDSHIELD_ANALYST_EMAIL` | Seeded analyst address |
 | `FRAUDSHIELD_ANALYST_PASSWORD` | Seeded analyst password |
+| `FRAUDSHIELD_WEBHOOK_SECRET` | HMAC secret for `/v1/webhooks/payment`; endpoint returns 503 if unset |
 | `AWS_ACCESS_KEY_ID` | AWS credential |
 | `AWS_SECRET_ACCESS_KEY` | AWS credential |
 
@@ -911,7 +1018,7 @@ Names only. No values.
 | `VITE_API_BASE` | Backend base URL |
 | `VITE_API_KEY` | Demo-only key; **compiled into the bundle, not a secret** |
 
-**No Razorpay variables exist.**
+**No Razorpay API key or secret variables exist**, because there is no Razorpay account. `FRAUDSHIELD_WEBHOOK_SECRET` is the shared HMAC secret between the local emitter and the ingestion endpoint; with a real provider it would hold their dashboard webhook secret.
 
 ---
 
@@ -919,8 +1026,9 @@ Names only. No values.
 
 ```
 AI_Risk_Manager/
-├── backend.py                  2,619 lines — the entire serving surface
-│                               features, scorer, rules, graph, auth, all 29 routes
+├── backend.py                  3,508 lines — the entire serving surface
+│                               features, scorer, rules, graph, auth, webhook,
+│                               all 30 routes
 ├── ml/
 │   ├── generate_dataset.py     1,021 — synthetic generator + self-audit
 │   ├── train.py                  132 — XGBoost + isotonic calibration
@@ -954,11 +1062,13 @@ AI_Risk_Manager/
 │   └── package.json
 ├── tests/
 │   ├── test_parity.py          136 — 22-feature offline/online parity
-│   └── test_score_parity.py    115 — 4-score parity
+│   ├── test_score_parity.py    115 — 4-score parity
+│   └── test_webhook.py         — 22 tests: signature, replay, mapping, flagging
 ├── scripts/
 │   ├── create_table.py         104 — DynamoDB table, idempotent
 │   ├── grant_role.py            71 — out-of-band role grant
-│   └── reset_staff.py           47 — delete a seeded staff account
+│   ├── reset_staff.py           47 — delete a seeded staff account
+│   └── emit_webhook.py          — signed event emitter (the simulated provider)
 ├── docs/
 │   ├── ARCHITECTURE.md         344
 │   ├── EVALUATION.md           383
@@ -991,7 +1101,8 @@ AI_Risk_Manager/
 - Rupee cost model with sensitivity analysis
 - Separate promo-abuse gate, evaluated per rule
 - Genuine model-unavailable fallback that keeps checkout serving
-- 29 REST endpoints
+- Webhook ingestion contract with real HMAC-SHA256 verification over the raw body, replay protection, staleness bounds, and a fail-closed default — 22 tests including forgery, tampering and replay
+- 30 REST endpoints
 - JWT + Argon2id auth with role-based authorisation
 - 6-tab analyst console and a complete customer storefront including a realistic payment interface
 - Failed-payment recording with IP flagging
@@ -1016,15 +1127,15 @@ AI_Risk_Manager/
 
 Prioritised.
 
-1. **Razorpay integration entirely** — no SDK, no webhook, no signature verification, no test-mode config
-2. **Webhook ingestion path** — the architecture's designated entry point does not exist
+1. **A real Razorpay account** — no test-mode keys, no SDK, no outbound call. The receiving contract exists; the provider does not
+2. **Razorpay outbound APIs** — order creation, payment fetch, refunds
 3. **Durable transaction store** — queue and entity graph die with the process
-4. **Per-decision audit rows**
+4. **Per-decision audit row for storefront orders** (webhook ingestion is audited)
 5. **`MODEL_FALLBACK_TRIGGERED` audit event**
 6. **CI pipeline** — no automated verification of the parity tests that protect the metrics
 7. **The three GSIs** — admin queries run from memory
 8. **Bounded automated actions** — BLOCK is terminal; no escalation tier, no action limits, no stopping rules
-9. **Test coverage** beyond parity
+9. **Test coverage** for `/v1/orders`, auth, rules and the frontend
 10. **F1 in the evaluation output**
 11. **Estimated ring exposure** in rupees
 12. **Settings page**

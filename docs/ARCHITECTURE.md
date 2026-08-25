@@ -415,13 +415,32 @@ Accessibility: risk levels are conveyed by label and icon as well as colour, so 
 
 ## 7. Local development
 
-```text
-docker compose up -d
-  dynamodb-local   :8000 internal, mapped :8001
-  api              :8000  uvicorn --reload
-  web              :5173  vite dev server
+> The compose file and Makefile described in earlier drafts of this document were
+> never built. There is no `docker-compose.yml`, no `Makefile`, no `infra/`, and no
+> `requirements.txt`. The commands below are the ones that actually work; see
+> README.md §24 for the full setup.
+
+```bash
+pip install -r requirements-dev.txt
+
+python ml/generate_dataset.py --n 100000   # writes ml/data/*.csv + metadata.json
+python ml/train.py                         # writes ml/artifacts/model.json + calibrator
+python ml/evaluate.py                      # writes ml/artifacts/metrics.json
+python ml/evaluate_promo.py --tune         # writes ml/artifacts/promo_metrics.json
+
+python -m uvicorn backend:app --port 8000 --forwarded-allow-ips=""
+cd web && npm install && npm run dev       # :5173
 ```
 
-`make bootstrap` creates the table and its three GSIs, seeds 40 products, and creates one admin and three customer accounts. `make dataset` generates labelled synthetic history. `make train` writes to `ml/artifacts/`. `make evaluate` writes `metrics.json` and the plots the admin metrics page reads.
+Use `python -m uvicorn`, not bare `uvicorn`: on a machine with more than one Python
+installation the `uvicorn` on PATH may belong to a different interpreter than the
+one `pip` installed into.
+
+DynamoDB is optional and off by default. `python scripts/create_table.py` creates
+the table; note it does **not** create the three GSIs in section 3, because nothing
+reads them yet. Staff accounts come from the startup seed
+(`FRAUDSHIELD_DEV_SEED_STAFF=1`) or `scripts/grant_role.py`, not from a bootstrap
+target. There is no product seeding step — the catalogue is a literal in
+`backend.py`.
 
 The generator is offline and local. It emits rows into DynamoDB Local, has no outbound network calls, and contains nothing that can be pointed at a payment processor.

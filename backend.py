@@ -77,6 +77,52 @@ from pydantic import BaseModel, Field
 
 _HERE = Path(__file__).resolve().parent
 
+
+def _load_dotenv(path: Path = _HERE / ".env") -> int:
+    """Read .env into os.environ before any config below is evaluated.
+
+    Hand-rolled rather than depending on python-dotenv: this is ~20 lines and the
+    serving image should not grow a dependency for it.
+
+    Two rules that matter:
+
+      - A variable already present in the real environment WINS. Otherwise a
+        stale .env on a server would silently override what the orchestrator
+        injected, which is the wrong precedence for a deployed service.
+      - A missing file is a no-op, so containers that inject config directly are
+        unaffected.
+
+    Without this the file is decorative: every os.environ.get below would fall to
+    its default, which is how a filled-in .env still produced an open API, an
+    ephemeral JWT secret and an in-memory store.
+    """
+    if not path.is_file():
+        return 0
+    loaded = 0
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[7:].strip()
+        value = value.strip()
+        # Strip one layer of matching quotes; leave inner characters alone.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+            loaded += 1
+    return loaded
+
+
+_DOTENV_COUNT = _load_dotenv()
+
 # Artifacts can be relocated for containers without touching code.
 ARTIFACTS = Path(os.environ.get("FRAUDSHIELD_ARTIFACTS", _HERE / "ml" / "artifacts"))
 DATA_CSV = Path(os.environ.get("FRAUDSHIELD_DATA", _HERE / "ml" / "data" / "transactions.csv"))
@@ -1608,6 +1654,10 @@ STATE: dict = {
     # requires knowing which IPFAIL# partitions exist. Bounded by distinct
     # failing IPs, not by attempt count.
     "fail_ips": set(),
+    # Provider event ids already ingested. A fast in-process guard in front of the
+    # WEBHOOK#EVENT lookup, since providers redeliver aggressively. The persisted
+    # item is what survives a restart; this only saves a read.
+    "webhook_seen": set(),
     "store": None, "scorer": None, "queue": [], "txns": {},
     "users": None, "users_backend": "?", "records": None, "records_backend": "?",
     "promo_queue": [], "audit": [],
@@ -1622,12 +1672,24 @@ def warm_store(store: InMemoryStore, limit: int, csv: Path = DATA_CSV) -> int:
 
     TRAIN SPLIT ONLY. Warming from validation or test would leak the evaluation
     period into serving state.
+
+    `limit` semantics, which used to be a trap:
+        0        warm nothing, return immediately
+        n > 0    warm the most recent n rows
+        n < 0    warm the entire train split
+
+    This was previously `if limit:`, so 0 fell through to "no slice applied" and
+    replayed all 69,593 train rows -- the exact opposite of what the value reads
+    like, and of what the Dockerfile's FRAUDSHIELD_WARM_ROWS=0 intends. It only
+    looked correct there because the image ships no CSV and returns early below.
     """
+    if limit == 0:
+        return 0
     if not csv.exists():
         return 0
     df = pd.read_csv(csv)
     df = df[df.split == "train"].sort_values("ts_epoch")
-    if limit:
+    if limit > 0:
         df = df.tail(limit)
     for r in df.groupby("customer_id", sort=False).head(1).itertuples():
         store.register_customer(r.customer_id, float(r.account_created_at))
@@ -1698,6 +1760,11 @@ async def lifespan(_app: FastAPI):
     STATE["users_backend"] = backend_desc
     STATE["records"] = records
     STATE["records_backend"] = records_desc
+    if _DOTENV_COUNT:
+        print(f"loaded {_DOTENV_COUNT} variables from .env "
+              "(real environment variables take precedence)")
+    else:
+        print("no .env loaded -- using real environment variables and defaults")
     print(f"warmed store with {n:,} historical transactions")
     print(f"model: {'DEGRADED (no artifact)' if scorer.degraded else scorer.model_version}")
     print(f"thresholds: review >= {scorer.review_t}, block >= {scorer.block_t}")
@@ -2990,6 +3057,327 @@ def list_returns(u: User = Depends(current_user)) -> dict:
         {k: v for k, v in r.items() if k not in ("PK", "SK", "customer_id")}
         for r in rows
     ]}
+
+
+# =============================================================================
+# 12. Payment webhook ingestion
+# =============================================================================
+#
+# WHAT THIS IS, PRECISELY
+# -----------------------
+# The ingestion contract a payment provider calls, implemented against
+# Razorpay's documented webhook shape and signature scheme.
+#
+# What is REAL here:
+#   - HMAC-SHA256 verification over the raw request body, constant-time compared
+#   - replay/idempotency protection keyed on the provider's event id
+#   - a staleness window bounding how long a captured signature stays useful
+#   - paise-to-rupee conversion, method mapping, customer resolution
+#   - scoring and persistence through the same Scorer the storefront uses
+#
+# What is SIMULATED:
+#   - the sender. Razorpay Test Mode requires a business account we do not have,
+#     so scripts/emit_webhook.py signs and posts events instead.
+#
+# This distinction is the whole point. The security-critical half -- verifying
+# that an unauthenticated public endpoint is really being called by the provider
+# -- is genuinely implemented and tested, including that a forged signature is
+# rejected. Pointing this at Razorpay is a secret and a URL, not a rewrite.
+#
+# Do NOT read this as "Razorpay integration works". It does not. There is no
+# Razorpay account, no API call to Razorpay, and no order created through them.
+
+WEBHOOK_SECRET = os.environ.get("FRAUDSHIELD_WEBHOOK_SECRET", "")
+
+# How long a signed event stays acceptable. A captured request body plus its
+# signature is replayable forever without this; the idempotency check already
+# stops a duplicate of a SEEN event, but a bound also limits an unseen one held
+# back and fired later. Razorpay retries for up to 24h, so this is generous.
+WEBHOOK_MAX_AGE_S = 86400.0
+
+# Provider method names -> the five this model was trained on. `emi` and
+# `cardless_emi` are card-funded, so they map to card rather than being dropped:
+# silently discarding an event would lose a transaction from the entity graph.
+WEBHOOK_METHOD_MAP = {
+    "card": "card", "emi": "card", "cardless_emi": "card",
+    "upi": "upi", "netbanking": "netbanking",
+    "wallet": "wallet", "cod": "cod", "cash": "cod",
+}
+
+
+def verify_webhook_signature(raw: bytes, signature: str, secret: str) -> bool:
+    """HMAC-SHA256 over the RAW body, hex digest, constant-time compared.
+
+    Two things here are load-bearing:
+
+      - The digest is computed over the exact bytes received. Re-serialising the
+        parsed JSON and hashing that is the classic mistake: key order, spacing
+        and unicode escaping all change the bytes, so a valid signature fails and
+        the usual "fix" is to stop verifying.
+      - compare_digest, not ==. A short-circuiting comparison leaks how many
+        leading bytes matched, which is enough to forge a signature byte by byte.
+    """
+    if not secret or not signature:
+        return False
+    expected = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature.strip().lower())
+
+
+def _webhook_customer_id(email: str, contact: str) -> tuple[str, str]:
+    """Resolve the provider's payer to one of our accounts.
+
+    Returns (customer_id, resolution) where resolution is 'account' or 'derived'.
+
+    A real account is preferred so the transaction joins that customer's existing
+    velocity and baseline history. When there is no match we derive a STABLE
+    pseudo-id from the identifier rather than minting a random one: a random id
+    would make every webhook event look like a brand-new customer, permanently
+    poisoning account_age_hours and prev_txn_count for genuine repeat payers.
+    """
+    ident = (email or contact or "").strip().lower()
+    if ident:
+        try:
+            users = STATE["users"]
+            u = users.get_by_email(ident) if "@" in ident else None
+            if u is not None:
+                return u.user_id, "account"
+        except Exception:  # noqa: BLE001
+            pass
+    if not ident:
+        return f"wh_anon_{uuid.uuid4().hex[:10]}", "derived"
+    digest = hmac.new(
+        IP_PEPPER.encode("utf-8"), ident.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return f"wh_{digest[:16]}", "derived"
+
+
+class WebhookResult(BaseModel):
+    event_id: str
+    payment_id: str
+    ingested: bool
+    duplicate: bool
+    decision: str | None = None
+    risk_score: float | None = None
+    transaction_id: str | None = None
+
+
+@app.post("/v1/webhooks/payment", response_model=WebhookResult)
+async def payment_webhook(request: Request) -> WebhookResult:
+    """Ingest a signed payment event, score it, persist it.
+
+    Unauthenticated by design -- a provider has no session and no API key. The
+    signature IS the authentication, which is why a missing or wrong one is a 401
+    and not a 400.
+
+    Accepts `X-Razorpay-Signature` or `X-Webhook-Signature` so the header name
+    does not have to change when a real provider is wired in.
+    """
+    raw = await request.body()
+
+    if not WEBHOOK_SECRET:
+        # Fail closed. An unverified webhook is strictly worse than no webhook:
+        # anyone who finds the URL could inject transactions into the risk engine
+        # and move the entity graph at will.
+        raise HTTPException(
+            503, "Webhook ingestion disabled: FRAUDSHIELD_WEBHOOK_SECRET is unset.",
+        )
+
+    signature = (
+        request.headers.get("x-razorpay-signature")
+        or request.headers.get("x-webhook-signature")
+        or ""
+    )
+    if not verify_webhook_signature(raw, signature, WEBHOOK_SECRET):
+        # Deliberately does not say whether the signature was absent, malformed or
+        # simply wrong.
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid webhook signature.")
+
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Body is not valid JSON.") from None
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Body must be a JSON object.")
+
+    event = body.get("event", "")
+    if event not in ("payment.captured", "payment.failed"):
+        # 200, not 4xx. A provider retries non-2xx, so rejecting an event we
+        # simply do not model would earn an indefinite retry loop.
+        return WebhookResult(
+            event_id=str(body.get("id", "")), payment_id="",
+            ingested=False, duplicate=False,
+        )
+
+    try:
+        entity = body["payload"]["payment"]["entity"]
+        payment_id = str(entity["id"])
+        amount_paise = int(entity["amount"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(422, "Malformed payment.* event payload.") from None
+
+    if amount_paise <= 0:
+        raise HTTPException(422, "Payment amount must be positive.")
+
+    event_id = (
+        request.headers.get("x-razorpay-event-id")
+        or str(body.get("id") or "")
+        or f"evt_{payment_id}"
+    )
+
+    created_at = float(body.get("created_at") or entity.get("created_at") or 0) or None
+    now = datetime.now(timezone.utc).timestamp()
+    if created_at and now - created_at > WEBHOOK_MAX_AGE_S:
+        raise HTTPException(422, "Event is older than the accepted window.")
+
+    records = STATE["records"]
+
+    # ---- idempotency ------------------------------------------------------
+    # Providers redeliver on any non-2xx and occasionally on success. Scoring the
+    # same payment twice would double every velocity counter it touches, which is
+    # the fastest way to manufacture a fraud ring out of one honest customer.
+    if event_id in STATE["webhook_seen"]:
+        return WebhookResult(event_id=event_id, payment_id=payment_id,
+                             ingested=False, duplicate=True)
+    try:
+        if records.get("WEBHOOK#EVENT", event_id) is not None:
+            STATE["webhook_seen"].add(event_id)
+            return WebhookResult(event_id=event_id, payment_id=payment_id,
+                                 ingested=False, duplicate=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ---- map the provider's shape onto ours --------------------------------
+    # Amount arrives in paise. Treating it as rupees would inflate every amount
+    # 100x and fire amount_anomaly on the entire event stream.
+    amount = round(amount_paise / 100.0, 2)
+    method = WEBHOOK_METHOD_MAP.get(str(entity.get("method", "")).lower(), "card")
+    settled = "success" if event == "payment.captured" else "failed"
+    email = str(entity.get("email") or "")
+    contact = str(entity.get("contact") or "")
+    customer_id, resolution = _webhook_customer_id(email, contact)
+
+    # device_fp and ip_hash cannot come from the connection here: the request is
+    # from the provider's servers, not the payer's browser. The merchant must
+    # forward them in `notes` at order-creation time. When absent, IP and device
+    # signals for this transaction are unavailable rather than wrong -- sentinels
+    # keep it out of real clusters instead of joining an arbitrary one.
+    notes = entity.get("notes") if isinstance(entity.get("notes"), dict) else {}
+    device_fp = str(notes.get("device_fp") or f"wh_nodev_{payment_id}")
+    note_ip = str(notes.get("ip_hash") or "")
+    ip_hash = note_ip or f"wh_noip_{payment_id}"
+    signals_complete = bool(notes.get("device_fp")) and bool(note_ip)
+
+    ts = created_at or now
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    txn = {
+        "customer_id": customer_id, "ts": ts, "amount": amount,
+        "payment_method": method, "device_fp": device_fp, "ip_hash": ip_hash,
+    }
+
+    store: InMemoryStore = STATE["store"]
+    scorer: Scorer = STATE["scorer"]
+
+    try:
+        d, feats = scorer.score(store, txn)
+    except Exception as exc:  # noqa: BLE001
+        # 503 so the provider retries. Idempotency was not recorded, so the retry
+        # will be scored rather than discarded as a duplicate.
+        raise HTTPException(
+            503, detail={"decision": "MANUAL_REVIEW", "reason": "SCORING_UNAVAILABLE",
+                         "error": type(exc).__name__},
+        ) from exc
+
+    store.commit({**txn, "status": settled,
+                 "hour": dt.hour + dt.minute / 60.0})
+
+    txn_id = f"pay_{uuid.uuid4().hex[:10]}"
+    record = {
+        "order_id": f"whk_{payment_id}", "transaction_id": txn_id,
+        "customer_id": customer_id, "email": email or contact,
+        "items": [], "item_count": 0,
+        "product_name": f"Webhook payment {payment_id}",
+        "amount": amount, "payment_method": method,
+        "instrument_display": f"{method} via provider",
+        "instrument_ref": payment_id, "instrument_account_count": 1,
+        "device_fp": device_fp, "ip_hash": ip_hash,
+        "settlement": settled, "created_at": dt.isoformat(),
+        "customer_status": "confirmed" if settled == "success" else "declined_by_bank",
+        "risk_score": d.risk_score, "decision": d.decision,
+        "sub_scores": d.sub_scores, "reason_codes": d.reason_codes,
+        "fired_rules": d.fired_rules, "override": d.override,
+        "return_status": None, "label": None,
+        # Provenance. An analyst must be able to tell an ingested event from a
+        # storefront order, because their available signals differ.
+        "source": "webhook", "provider_payment_id": payment_id,
+        "provider_event_id": event_id,
+        "customer_resolution": resolution,
+        "signals_complete": signals_complete,
+        "ip_suspicious": False,
+    }
+    records.put(f"CUSTOMER#{customer_id}", f"ORDER#{dt.isoformat()}#{record['order_id']}",
+                record)
+    records.put("INDEX#ORDER", record["order_id"],
+                {"customer_id": customer_id,
+                 "sk": f"ORDER#{dt.isoformat()}#{record['order_id']}"})
+
+    # Same failed-attempt path the storefront uses, so a card-testing burst
+    # arriving by webhook flags the address exactly as one at checkout would.
+    if settled == "failed" and ip_hash and not ip_hash.startswith("wh_noip_"):
+        attempt_id = f"fail_{uuid.uuid4().hex[:10]}"
+        attempt = {
+            "attempt_id": attempt_id, "order_id": record["order_id"],
+            "transaction_id": txn_id, "customer_id": customer_id,
+            "email": email or contact, "amount": amount,
+            "payment_method": method,
+            "instrument_display": record["instrument_display"],
+            "instrument_ref": payment_id, "device_fp": device_fp,
+            "ip_hash": ip_hash, "risk_score": d.risk_score,
+            "decision": d.decision, "customer_status": record["customer_status"],
+            "created_at": dt.isoformat(), "source": "webhook",
+        }
+        records.put(f"IPFAIL#{ip_hash}", f"ATTEMPT#{dt.isoformat()}#{attempt_id}",
+                    attempt)
+        STATE["fail_ips"].add(ip_hash)
+        flag = store.evaluate_ip_suspicion(ip_hash, ts)
+        if flag is not None:
+            record["ip_suspicious"] = True
+            records.put("SUSPICIOUS#IP", ip_hash, {
+                "ip_hash": ip_hash, "since": flag["since"],
+                "reason": flag["reason"], "last_seen": dt.isoformat(),
+                "failures_total": flag["failures_total"],
+                "accounts": flag["accounts"],
+            })
+            if flag["new"]:
+                audit(actor="system", action="ip_marked_suspicious",
+                      before={"ip_hash": ip_hash}, after=flag)
+
+    STATE["txns"][txn_id] = {**record, "features": feats,
+                             "scored_at": dt.isoformat()}
+    if d.decision in ("MANUAL_REVIEW", "BLOCK"):
+        STATE["queue"].append(txn_id)
+
+    # Recorded only after successful processing, so a failure earlier can retry.
+    STATE["webhook_seen"].add(event_id)
+    try:
+        records.put("WEBHOOK#EVENT", event_id, {
+            "event_id": event_id, "payment_id": payment_id, "event": event,
+            "transaction_id": txn_id, "received_at": dt.isoformat(),
+            "decision": d.decision, "risk_score": d.risk_score,
+        })
+    except Exception:  # noqa: BLE001
+        pass
+
+    audit(actor="webhook", action="payment_event_ingested",
+          before={"event": event, "payment_id": payment_id, "event_id": event_id},
+          after={"transaction_id": txn_id, "decision": d.decision,
+                 "risk_score": d.risk_score, "settlement": settled,
+                 "customer_resolution": resolution,
+                 "signals_complete": signals_complete})
+
+    return WebhookResult(
+        event_id=event_id, payment_id=payment_id, ingested=True, duplicate=False,
+        decision=d.decision, risk_score=d.risk_score, transaction_id=txn_id,
+    )
 
 
 @app.get("/health")

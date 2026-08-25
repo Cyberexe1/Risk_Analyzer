@@ -35,10 +35,17 @@ USER fraudshield
 
 EXPOSE 8000
 
-# SECURITY: set FRAUDSHIELD_API_KEY at run time. If it is unset every endpoint is
-# open, and the service says so on startup. There is no per-user auth, no roles
-# and no rate limiting yet -- see docs/ARCHITECTURE.md section 4. Do not expose
-# this to the internet as-is; put it behind an authenticated gateway.
+# SECURITY: set FRAUDSHIELD_API_KEY at run time. If it is unset the two
+# service-to-service risk endpoints are open, and the service says so on startup.
+#
+# Per-user auth, role gating and login rate limiting DO exist now: JWT access
+# tokens with an httpOnly refresh cookie, Argon2id credentials, and require_role
+# on every admin route. Also set, or accept the consequences printed at boot:
+#   FRAUDSHIELD_JWT_SECRET      unset -> ephemeral, every restart drops sessions
+#   FRAUDSHIELD_IP_PEPPER       unset -> ephemeral, entity fingerprints reset
+#   FRAUDSHIELD_COOKIE_SECURE   must be true behind HTTPS
+#   FRAUDSHIELD_WEBHOOK_SECRET  unset -> /v1/webhooks/payment refuses with 503
+# Still absent: email verification, password reset, MFA.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"
 
