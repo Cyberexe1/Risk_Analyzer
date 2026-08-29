@@ -26,8 +26,12 @@ dev = ["scikit-learn==1.7.1"]
 # backend.py is the whole serving surface, so it is a single top-level module
 # rather than a package. `pip install .` then makes `import backend` work from any
 # working directory, which is what removes the PYTHONPATH dependency.
+#
+# payments.py and notifications.py must be listed too: backend.py imports both at
+# module scope, so an install that omits either produces an ImportError at startup
+# rather than a degraded-but-serving process.
 [tool.setuptools]
-py-modules = ["backend"]
+py-modules = ["backend", "payments", "notifications"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

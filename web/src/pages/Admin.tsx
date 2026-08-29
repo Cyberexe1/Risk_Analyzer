@@ -15,9 +15,18 @@ import AdminMetricsPanel from './AdminMetrics'
 import RingView from './RingView'
 import Thresholds from './Thresholds'
 import SuspiciousIps from './SuspiciousIps'
+import Audit from './Audit'
+import DemoAttack from './DemoAttack'
 import { useAuth } from '../auth'
 
-type Tab = 'queue' | 'rings' | 'ips' | 'promo' | 'metrics' | 'thresholds'
+type Tab =
+  | 'queue'
+  | 'rings'
+  | 'ips'
+  | 'promo'
+  | 'metrics'
+  | 'thresholds'
+  | 'audit'
 type Seed = { type: 'device' | 'ip' | 'account'; id: string }
 
 /**
@@ -115,6 +124,22 @@ export default function Admin() {
           <span className="chip">
             {health?.user_store?.startsWith('dynamodb') ? 'DynamoDB' : 'in-memory'}
           </span>
+          {/* Which gateway produced the settlement values in this queue. An
+              analyst reading a "verifying" row needs to know whether it is
+              waiting on a real provider callback or came from the simulator. */}
+          <span
+            className="chip"
+            title={health?.payment_provider_status?.note || undefined}
+          >
+            {health?.payment_provider === 'razorpay' ? 'Razorpay' : 'simulated gateway'}
+            {health?.payment_provider_status?.degraded ? ' (degraded)' : ''}
+          </span>
+          {/* Admin-only, and only when the server says both demo gates are open.
+              The endpoint enforces the role itself; hiding the control from an
+              analyst just avoids offering a button that can only 403. */}
+          {user?.role === 'admin' && (
+            <DemoAttack status={health?.demo} onGenerated={refresh} />
+          )}
           <button className="btn btn-ghost btn-sm" onClick={() => void refresh()}>
             Refresh
           </button>
@@ -150,6 +175,13 @@ export default function Admin() {
             ['promo', `Promo abuse (${holds.length})`],
             ['metrics', 'Model performance'],
             ['thresholds', 'Thresholds'],
+            // Admin-only: GET /v1/admin/audit requires the admin role, so showing
+            // an analyst a tab that can only 403 would be a worse experience than
+            // not showing it. The server check is what enforces this; the hidden
+            // tab is presentation.
+            ...((user?.role === 'admin'
+              ? [['audit', 'Audit trail']]
+              : []) as [Tab, string][]),
           ] as [Tab, string][]
         ).map(([k, label]) => (
           <button
@@ -501,6 +533,8 @@ export default function Admin() {
 
       {/* ---------------- threshold tuner ---------------- */}
       {tab === 'thresholds' && <Thresholds canEdit={user?.role === 'admin'} />}
+
+      {tab === 'audit' && user?.role === 'admin' && <Audit />}
 
       <p className="muted" style={{ marginTop: 'var(--sp-6)' }}>
         The review queue lives in the backend&rsquo;s process memory and is lost on

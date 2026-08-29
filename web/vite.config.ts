@@ -10,4 +10,16 @@ export default defineConfig({
     // from the network.
     host: '127.0.0.1',
   },
+  test: {
+    // jsdom rather than a real browser: these tests assert what a role can SEE,
+    // which is a DOM question, not a rendering one.
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: ['./src/test/setup.ts'],
+    include: ['src/**/*.test.{ts,tsx}'],
+    // No coverage gate. A percentage would reward testing whatever is easy to
+    // reach; these tests are chosen for what they protect, not for their line
+    // count.
+    css: false,
+  },
 })

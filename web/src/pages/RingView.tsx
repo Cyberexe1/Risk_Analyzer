@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { api, ApiError, type RingGraph, type RingNode } from '../api'
+import { api, ApiError, rupees, type RingGraph, type RingNode } from '../api'
 import { ErrorNote } from '../components'
 
 type Positioned = RingNode & { x: number; y: number; vx: number; vy: number }
@@ -181,6 +181,69 @@ export default function RingView({
               Each account may look ordinary alone. The structure is the evidence.
             </div>
           )}
+          {/* Estimated exposure.
+              The tooltip and the caption are not decoration: an unqualified rupee
+              figure next to a "fraud ring" heading reads as money stolen, and
+              nothing here supports that claim. `confirmed_fraud_amount` is the only
+              field backed by ground truth, and it is null until a human labels
+              something. */}
+          {g.exposure && (
+            <div className="card" style={{ marginBottom: 'var(--sp-3)' }}>
+              <div className="spread">
+                <h3 className="t-base" title={g.exposure.definition}>
+                  Estimated exposure: {rupees(g.exposure.gross_exposure)}
+                </h3>
+                <span className="chip">
+                  {g.exposure.complete ? 'retained history' : 'partial'}
+                </span>
+              </div>
+
+              <div className="pill-row" style={{ marginTop: 'var(--sp-2)' }}>
+                <span className="chip" title="Refused before authorisation. No money moved.">
+                  blocked {rupees(g.exposure.blocked_amount)}
+                </span>
+                <span className="chip" title="Sent to a human for review.">
+                  in review {rupees(g.exposure.review_amount)}
+                </span>
+                <span className="chip" title="Allowed through by the engine.">
+                  allowed {rupees(g.exposure.allowed_amount)}
+                </span>
+                <span className="chip" title="Payments that actually settled successfully.">
+                  settled {rupees(g.exposure.settled_amount)}
+                </span>
+                <span
+                  className="chip"
+                  title="Amount on transactions a human has labelled fraud. Null until someone rules on one."
+                >
+                  confirmed fraud{' '}
+                  {g.exposure.confirmed_fraud_amount === null
+                    ? 'not established'
+                    : rupees(g.exposure.confirmed_fraud_amount)}
+                </span>
+              </div>
+
+              <p className="muted t-xs" style={{ marginTop: 'var(--sp-3)' }}>
+                {g.exposure.definition}
+              </p>
+              <p className="muted t-xs">
+                Counted {g.exposure.transactions_counted} transaction
+                {g.exposure.transactions_counted === 1 ? '' : 's'} across{' '}
+                {g.exposure.accounts_with_transactions} of{' '}
+                {g.exposure.accounts_in_component} accounts
+                {g.exposure.transactions_skipped > 0 &&
+                  `, skipping ${g.exposure.transactions_skipped} with unusable amounts`}
+                . {g.exposure.window.note}
+              </p>
+              {!g.exposure.complete && (
+                <div className="note note-warn" style={{ marginTop: 'var(--sp-2)' }}>
+                  <strong>This figure is a floor, not a total.</strong> Some
+                  transactions could not be counted, so the real associated amount is
+                  higher than shown.
+                </div>
+              )}
+            </div>
+          )}
+
           {g.counts.accounts < 3 && (
             <div className="note" style={{ marginBottom: 'var(--sp-3)' }}>
               Fewer than 3 accounts in this component, so the network layer scores it 0.

@@ -4,6 +4,10 @@ import { Stat } from '../components'
 const pct = (n: number) => `${(n * 100).toFixed(1)}%`
 const f3 = (n: number) => n.toFixed(3)
 
+/** F1 renders as an em dash when the artifact predates F1 reporting. Showing 0.000
+ *  for a metric that was never computed would be a fabricated measurement. */
+const f1 = (n: number | undefined) => (typeof n === 'number' ? n.toFixed(3) : '\u2014')
+
 function Bar({ name, value, max, colour }: { name: string; value: number; max: number; colour: string }) {
   return (
     <div className="hbar">
@@ -83,6 +87,7 @@ export default function AdminMetrics({ m }: { m: AdminMetrics }) {
                       <th scope="col">Gate</th>
                       <th scope="col">Precision</th>
                       <th scope="col">Recall</th>
+                      <th scope="col">F1</th>
                       <th scope="col">Volume</th>
                     </tr>
                   </thead>
@@ -93,6 +98,7 @@ export default function AdminMetrics({ m }: { m: AdminMetrics }) {
                       </td>
                       <td className="num">{f3(t.review_gate.precision)}</td>
                       <td className="num">{f3(t.review_gate.recall)}</td>
+                      <td className="num">{f1(t.review_gate.f1)}</td>
                       <td className="num">{pct(t.review_gate.volume_share)}</td>
                     </tr>
                     <tr>
@@ -101,11 +107,30 @@ export default function AdminMetrics({ m }: { m: AdminMetrics }) {
                       </td>
                       <td className="num">{f3(t.block_gate.precision)}</td>
                       <td className="num">{f3(t.block_gate.recall)}</td>
+                      <td className="num">{f1(t.block_gate.f1)}</td>
                       <td className="num">{pct(t.block_gate.volume_share)}</td>
                     </tr>
                   </tbody>
                 </table>
               </div>
+              <p className="muted t-xs" style={{ marginTop: 'var(--sp-2)' }}>
+                Precision = TP/(TP+FP). Recall = TP/(TP+FN). F1 = 2PR/(P+R).
+                {t.classification && (
+                  <>
+                    {' '}
+                    The operating point was fixed on the validation split by
+                    expected-cost minimisation, before the test split was scored.
+                  </>
+                )}{' '}
+                F1 weights a missed fraud and a wrongly blocked customer equally;
+                the cost model below puts them{' '}
+                {Math.round(
+                  (t.cost.unit_costs.block_legit_cost ?? 0) /
+                    (t.cost.unit_costs.review_cost ?? 1),
+                )}
+                &times; apart, so F1 is shown for comparability and is not what the
+                thresholds optimise.
+              </p>
               {t.block_gate.precision >= 0.999 && (
                 <div className="note note-warn" style={{ marginTop: 'var(--sp-3)' }}>
                   <strong>Block precision of {f3(t.block_gate.precision)} is a warning,
@@ -160,6 +185,118 @@ export default function AdminMetrics({ m }: { m: AdminMetrics }) {
                 &times; more expensive per error than reviewing, which is why most risk
                 goes to a human.
               </p>
+            </div>
+          </div>
+
+          {/* Phase 8: the economics, with both error types side by side and the
+              basis of the numbers stated up front. An unlabelled rupee figure on a
+              dashboard reads as accounting; these are assumptions. */}
+          <div className="card" style={{ marginTop: 'var(--sp-4)' }}>
+            <div className="spread">
+              <h3 className="t-base">Economic model</h3>
+              <span className="chip">Estimated &mdash; not observed losses</span>
+            </div>
+            <p className="muted t-sm" style={{ marginTop: 'var(--sp-2)' }}>
+              {t.cost.basis ??
+                'Estimated economic model. Unit costs are industry-typical assumptions used to compare operating points, NOT observed losses and NOT a real merchant&rsquo;s audited figures.'}
+            </p>
+
+            <div className="grid grid-4" style={{ marginTop: 'var(--sp-3)' }}>
+              <Stat
+                k="False-positive cost"
+                v={rupees(t.cost.false_positive_cost)}
+                n={`${t.confusion.fp_block} blocked + ${t.confusion.fp_review} reviewed`}
+              />
+              <Stat
+                k="Review cost"
+                v={rupees(
+                  (t.cost.cost_breakdown?.legit_reviewed ?? 0) +
+                    (t.cost.cost_breakdown?.fraud_reviewed ?? 0),
+                )}
+                n={`${t.confusion.fp_review + t.confusion.tp_review} cases at ${rupees(
+                  t.cost.unit_costs.review_cost ?? 0,
+                )} each`}
+              />
+              <Stat
+                k="Fraud-loss cost"
+                v={
+                  typeof t.cost.false_negative_cost === 'number'
+                    ? rupees(t.cost.false_negative_cost)
+                    : '\u2014'
+                }
+                n={`${t.cost.fraud_missed ?? t.confusion.fn} allowed through`}
+              />
+              <Stat
+                k="Net expected saving"
+                v={rupees(t.cost.net_saving)}
+                n={`${pct(t.cost.net_saving_pct)} vs allowing everything`}
+              />
+            </div>
+
+            {t.cost.cost_breakdown && (
+              <div className="table-shell" style={{ marginTop: 'var(--sp-4)' }}>
+                <table>
+                  <caption className="sr-only">
+                    Estimated cost by outcome at the chosen operating point
+                  </caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">Outcome</th>
+                      <th scope="col">Who pays</th>
+                      <th scope="col">Estimated cost</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>Fraud allowed through</td>
+                      <td className="muted">Merchant</td>
+                      <td className="num">
+                        {rupees(t.cost.cost_breakdown.fraud_allowed_through)}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>Legitimate customer blocked</td>
+                      <td className="muted">Customer, then merchant</td>
+                      <td className="num">
+                        {rupees(t.cost.cost_breakdown.legit_blocked)}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>Legitimate customer reviewed</td>
+                      <td className="muted">Analyst time</td>
+                      <td className="num">
+                        {rupees(t.cost.cost_breakdown.legit_reviewed)}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>Fraud reviewed</td>
+                      <td className="muted">Analyst time</td>
+                      <td className="num">
+                        {rupees(t.cost.cost_breakdown.fraud_reviewed)}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>Fraud blocked</td>
+                      <td className="muted">Nobody &mdash; the loss was avoided</td>
+                      <td className="num">
+                        {rupees(t.cost.cost_breakdown.fraud_blocked)}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <div className="note" style={{ marginTop: 'var(--sp-3)' }}>
+              These costs are assumptions used to compare operating points, not
+              observed losses. They come from{' '}
+              <code>ml/cost_model.py</code> and are stated per unit:{' '}
+              {rupees(t.cost.unit_costs.fraud_loss ?? 0)} per missed fraud,{' '}
+              {rupees(t.cost.unit_costs.review_cost ?? 0)} per review,{' '}
+              {rupees(t.cost.unit_costs.block_legit_cost ?? 0)} per wrongly blocked
+              customer. Change the assumptions and the optimal thresholds move &mdash;
+              which is the point of publishing them rather than hiding them in a
+              constant.
             </div>
           </div>
 

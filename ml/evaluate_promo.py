@@ -155,12 +155,19 @@ def main() -> None:
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
     fp_rate = fp / (fp + tn) if fp + tn else 0.0
+    # Reported for the same reason as on the transaction gate: precision and recall
+    # were both here, so a reader had to compute the balanced figure themselves.
+    # F1 is more defensible on THIS gate than on the transaction gate, because a
+    # wrongly denied cashback and a granted abusive one are much closer in cost
+    # than a wrongly blocked sale and a missed fraud.
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
 
     print("\nconfusion at the redemption gate (HOLD or DENY counts as flagged)")
     print("                   DENY/HOLD    ALLOW")
     print(f"  abuse         {tp:>10}{fn:>9}     recall     {recall:.4f}")
     print(f"  legitimate    {fp:>10}{tn:>9}     FP rate    {fp_rate:.4f}")
     print(f"                                        precision  {precision:.4f}")
+    print(f"                                        F1         {f1:.4f}")
 
     # Split by action: a DENY is the consequential one, a HOLD costs a review.
     d_tp = int((denied & (y == 1)).sum())
@@ -228,6 +235,7 @@ def main() -> None:
                        "validation": round(float(va.abuse_label.mean()), 5),
                        "test": round(float(te.abuse_label.mean()), 5)},
         "gate": {"precision": round(precision, 4), "recall": round(recall, 4),
+                 "f1": round(f1, 4),
                  "fp_rate": round(fp_rate, 5), "tp": tp, "fp": fp, "fn": fn, "tn": tn},
         "deny": {"n": d_tp + d_fp, "tp": d_tp, "fp": d_fp,
                  "precision": round(d_tp / (d_tp + d_fp), 4) if d_tp + d_fp else None},

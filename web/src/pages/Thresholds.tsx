@@ -5,6 +5,9 @@ import { ErrorNote, Stat } from '../components'
 const W = 640
 const H = 210
 
+/** The wire value the backend emits for a threshold change. */
+const THRESHOLD_UPDATE_ACTION = 'threshold_update'
+
 /**
  * Threshold tuner.
  *
@@ -22,6 +25,7 @@ export default function Thresholds({ canEdit }: { canEdit: boolean }) {
   const [audit, setAudit] = useState<AuditEntry[]>([])
   const [review, setReview] = useState(5)
   const [block, setBlock] = useState(70)
+  const [reason, setReason] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [flash, setFlash] = useState<string | null>(null)
@@ -34,9 +38,12 @@ export default function Thresholds({ canEdit }: { canEdit: boolean }) {
       setBlock(t.current.block)
       setError(null)
       if (canEdit) {
+        // Filtered server-side now. The action name stays lower-case because that
+        // spelling already exists in persisted audit partitions -- renaming it
+        // would orphan every historical change.
         await api
-          .audit()
-          .then((a) => setAudit(a.entries.filter((e) => e.action === 'threshold_update')))
+          .audit({ action: THRESHOLD_UPDATE_ACTION, limit: 200 })
+          .then((a) => setAudit(a.entries))
           .catch(() => setAudit([]))
       }
     } catch (e) {
@@ -93,11 +100,15 @@ export default function Thresholds({ canEdit }: { canEdit: boolean }) {
     setError(null)
     setFlash(null)
     try {
-      const r = await api.setThresholds(review, block)
+      const r = await api.setThresholds(review, block, reason)
       setFlash(
         `Applied: review \u2265 ${r.current.review}, block \u2265 ${r.current.block} ` +
-          `(was ${r.previous.review} / ${r.previous.block}). New traffic only.`,
+          `(was ${r.previous.review} / ${r.previous.block}). New traffic only` +
+          (r.persisted
+            ? `, and saved as configuration v${r.version} \u2014 it survives a restart.`
+            : '.'),
       )
+      setReason('')
       await load()
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
@@ -120,6 +131,38 @@ export default function Thresholds({ canEdit }: { canEdit: boolean }) {
 
       {info && (
         <>
+          {/* Where the live values came from. `degraded` means a stored
+              configuration was rejected, so the running thresholds are NOT the ones
+              an admin last set -- exactly the log-versus-behaviour mismatch that
+              persisting them was meant to remove, so it is stated loudly. */}
+          {info.config?.degraded && (
+            <div className="note note-warn" role="alert">
+              <strong>Stored threshold configuration was rejected.</strong>{' '}
+              {info.config.note} The service is running on environment defaults, so
+              the values below are not the ones last saved.
+            </div>
+          )}
+          {info.config && !info.config.degraded && (
+            <div className="pill-row">
+              <span className="chip">
+                source: {info.config.source === 'persisted' ? 'saved configuration' : 'environment defaults'}
+              </span>
+              {info.config.source === 'persisted' && (
+                <>
+                  <span className="chip">v{info.config.version}</span>
+                  <span className="chip">set by {info.config.updated_by}</span>
+                  <span className="chip">survives restart</span>
+                </>
+              )}
+              {info.config.source === 'env' && (
+                <span className="chip">
+                  defaults {info.config.env_defaults.review} /{' '}
+                  {info.config.env_defaults.block}
+                </span>
+              )}
+            </div>
+          )}
+
           <div className="grid grid-4">
             <Stat k="Review at" v={`\u2265 ${info.current.review}`} n="live cut-off" />
             <Stat k="Block at" v={`\u2265 ${info.current.block}`} n="live cut-off" />
@@ -205,7 +248,26 @@ export default function Thresholds({ canEdit }: { canEdit: boolean }) {
             )}
 
             {canEdit ? (
-              <div className="row row-tight" style={{ marginTop: 'var(--sp-4)' }}>
+              <div className="stack" style={{ marginTop: 'var(--sp-4)' }}>
+                <div>
+                  <label className="lbl" htmlFor="threshold-reason">
+                    Reason (optional)
+                  </label>
+                  <input
+                    id="threshold-reason"
+                    type="text"
+                    maxLength={280}
+                    value={reason}
+                    placeholder="e.g. two analysts on leave this week"
+                    onChange={(e) => setReason(e.target.value)}
+                  />
+                  <p className="muted t-xs">
+                    Recorded on the audit event. Never used to decide whether the
+                    change is permitted &mdash; the ordering rule is enforced
+                    regardless.
+                  </p>
+                </div>
+              <div className="row row-tight">
                 <button className="btn" disabled={busy || !dirty || invalid} onClick={save}>
                   {busy ? 'Applying\u2026' : 'Apply thresholds'}
                 </button>
@@ -220,6 +282,7 @@ export default function Thresholds({ canEdit }: { canEdit: boolean }) {
                     Reset
                   </button>
                 )}
+              </div>
               </div>
             ) : (
               <div className="note" style={{ marginTop: 'var(--sp-4)' }}>
@@ -342,6 +405,7 @@ export default function Thresholds({ canEdit }: { canEdit: boolean }) {
                         <th scope="col">Who</th>
                         <th scope="col">From</th>
                         <th scope="col">To</th>
+                        <th scope="col">Reason</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -352,10 +416,13 @@ export default function Thresholds({ canEdit }: { canEdit: boolean }) {
                           </td>
                           <td className="mono t-2xs">{e.actor}</td>
                           <td className="num">
-                            {e.before.review} / {e.before.block}
+                            {String(e.before.review)} / {String(e.before.block)}
                           </td>
                           <td className="num">
-                            {e.after.review} / {e.after.block}
+                            {String(e.after.review)} / {String(e.after.block)}
+                          </td>
+                          <td className="muted t-2xs">
+                            {(e.after.reason as string) || '\u2014'}
                           </td>
                         </tr>
                       ))}

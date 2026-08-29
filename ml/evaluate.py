@@ -71,16 +71,42 @@ def confusion(score, y, review_t, block_t):
     )
 
 
+def f1_of(precision: float, recall: float) -> float:
+    """Harmonic mean of precision and recall.
+
+    Added because the evaluation reported precision and recall but not F1, so a
+    reader had to compute it themselves -- and the two gates trade off in opposite
+    directions, which is exactly the case where a single balanced number is worth
+    having.
+
+    Stated plainly so nobody has to guess the definition:
+
+        F1 = 2PR / (P + R)
+
+    Zero when both are zero, which is the degenerate case rather than an error.
+
+    F1 is reported ALONGSIDE precision and recall, never instead of them. It
+    weights a missed fraud and a wrongly blocked customer equally, and this
+    system's own cost model says they differ by about 41x -- so F1 is the wrong
+    number to optimise here and is published for comparability, not for tuning.
+    """
+    return round(2 * precision * recall / (precision + recall), 4) \
+        if (precision + recall) else 0.0
+
+
 def gate_metrics(score, y, t):
     flagged = score >= t
     tp = int((flagged & (y == 1)).sum())
     fp = int((flagged & (y == 0)).sum())
     fn = int((~flagged & (y == 1)).sum())
     tn = int((~flagged & (y == 0)).sum())
+    precision = round(tp / (tp + fp), 4) if tp + fp else 0.0
+    recall = round(tp / (tp + fn), 4) if tp + fn else 0.0
     return {
         "threshold": float(t),
-        "precision": round(tp / (tp + fp), 4) if tp + fp else 0.0,
-        "recall": round(tp / (tp + fn), 4) if tp + fn else 0.0,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1_of(precision, recall),
         "fp_rate": round(fp / (fp + tn), 5) if fp + tn else 0.0,
         "volume_share": round(float(flagged.mean()), 5),
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
@@ -266,7 +292,8 @@ def main() -> None:
     print(f"\noperating points")
     for nm, g in (("review", review_gate), ("block", block_gate)):
         print(f"  {nm:<7} >= {g['threshold']:>2.0f}   precision {g['precision']:.3f}"
-              f"   recall {g['recall']:.3f}   FP rate {g['fp_rate']:.4f}"
+              f"   recall {g['recall']:.3f}   F1 {g['f1']:.3f}"
+              f"   FP rate {g['fp_rate']:.4f}"
               f"   volume {g['volume_share']:.2%}")
 
     c = confusion(s_te, yte, REVIEW_T, BLOCK_T)
@@ -330,6 +357,9 @@ def main() -> None:
           f"{c['fp_review'] * COSTS.review_cost:>12,.0f}")
     print(f"  false-positive cost           Rs {fp_cost:>12,.0f}"
           f"   ({fp_cost / total_cost:.1%} of remaining cost)")
+    print(f"  ---- and paid on fraud we missed ----")
+    print(f"  {c['fn']} allowed through       Rs "
+          f"{c['fn'] * COSTS.fraud_loss:>12,.0f}")
     print(f"\n  blocking is {COSTS.block_legit_cost / COSTS.review_cost:.0f}x more "
           f"expensive per error than reviewing -- which is why most risk is routed"
           f"\n  to a human instead of declined outright.")
@@ -406,6 +436,54 @@ def main() -> None:
                        "selected_on": "validation", "method": "expected cost minimisation"},
         "review_gate": review_gate,
         "block_gate": block_gate,
+        # Classification metrics at the SELECTED operating point, grouped and
+        # defined explicitly so nobody has to reverse-engineer what "precision"
+        # refers to when a system has two gates.
+        #
+        # The operating point is NOT chosen to flatter these numbers: it was fixed
+        # on the validation split by expected-cost minimisation under an
+        # analyst-capacity ceiling, BEFORE the test split was scored. F1 at the
+        # cost-optimal point is reported as-is, including the fact that the block
+        # gate's F1 is dragged down by recall while its precision is 1.000.
+        "classification": {
+            "operating_point": {"review": REVIEW_T, "block": BLOCK_T},
+            "operating_point_selection": (
+                "expected-cost minimisation on the validation split under an "
+                "analyst-capacity ceiling; not tuned on test, and not chosen to "
+                "improve any metric reported here"
+            ),
+            # `flagged` = score >= review threshold. This is the detector's own
+            # operating point: everything at or above it receives attention, and
+            # BLOCK is the subset that is refused outright.
+            "flagged_gate": {
+                "definition": "score >= review threshold (review OR block)",
+                "precision": review_gate["precision"],
+                "recall": review_gate["recall"],
+                "f1": review_gate["f1"],
+                "tp": review_gate["tp"], "fp": review_gate["fp"],
+                "fn": review_gate["fn"], "tn": review_gate["tn"],
+            },
+            "block_gate": {
+                "definition": "score >= block threshold (payment refused)",
+                "precision": block_gate["precision"],
+                "recall": block_gate["recall"],
+                "f1": block_gate["f1"],
+                "tp": block_gate["tp"], "fp": block_gate["fp"],
+                "fn": block_gate["fn"], "tn": block_gate["tn"],
+            },
+            "definitions": {
+                "precision": "TP / (TP + FP)",
+                "recall": "TP / (TP + FN)",
+                "f1": "2PR / (P + R), the harmonic mean",
+                "positive_class": "fraud_label == 1 in the held-out test split",
+                "f1_caveat": (
+                    "F1 weights a missed fraud and a wrongly blocked customer "
+                    "equally. This system's own cost model puts them ~41x apart, "
+                    "so F1 is published for comparability and is deliberately NOT "
+                    "what the thresholds optimise."
+                ),
+            },
+        },
         "confusion": c,
         "recall_by_archetype": arche,
         "baselines": baselines,
@@ -424,7 +502,26 @@ def main() -> None:
             "net_saving_pct": round((nothing - total_cost) / nothing, 4),
             "false_positive_cost": round(fp_cost, 2),
             "false_positive_share_of_remaining": round(fp_cost / total_cost, 4),
+            # The other side of the ledger, previously only implicit in
+            # `with_fraudshield`. Reported explicitly so the two error types can be
+            # compared directly instead of one being visible and the other buried.
+            "false_negative_cost": round(c["fn"] * COSTS.fraud_loss, 2),
+            "cost_breakdown": {
+                "fraud_allowed_through": round(c["fn"] * COSTS.fraud_loss, 2),
+                "legit_blocked": round(c["fp_block"] * COSTS.block_legit_cost, 2),
+                "legit_reviewed": round(c["fp_review"] * COSTS.review_cost, 2),
+                "fraud_reviewed": round(c["tp_review"] * COSTS.review_cost, 2),
+                "fraud_blocked": round(c["tp_block"] * COSTS.fraud_blocked_cost, 2),
+            },
             "legit_blocked": c["fp_block"],
+            "fraud_missed": c["fn"],
+            # Named here as well as in `caveats`, because this block is what the
+            # console renders and an unlabelled rupee figure reads as accounting.
+            "basis": (
+                "Estimated economic model. Unit costs are industry-typical "
+                "assumptions used to compare operating points, NOT observed losses "
+                "and NOT a real merchant's audited figures."
+            ),
             "sensitivity": sensitivity(),
         },
         "fairness": fairness,

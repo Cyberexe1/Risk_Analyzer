@@ -1,4 +1,5 @@
-# Serving image. Carries backend.py and the model artifacts, nothing else.
+# Serving image. Carries backend.py, payments.py and the model artifacts, nothing
+# else.
 #
 # Deliberately excluded: ml/generate_dataset.py, ml/train.py, ml/evaluate.py,
 # ml/scoring.py, tests/, and the 20 MB dataset CSV. None of it runs in production,
@@ -17,7 +18,10 @@ RUN pip install --no-cache-dir -r requirements-serve.txt
 COPY ml/artifacts/model.json ml/artifacts/calibrator.json \
      ml/artifacts/feature_spec.json /srv/artifacts/
 
-COPY backend.py .
+# payments.py and notifications.py are imported by backend.py at module scope.
+# Omitting either breaks startup outright, so they are copied alongside rather
+# than treated as optional.
+COPY backend.py payments.py notifications.py ./
 
 ENV FRAUDSHIELD_ARTIFACTS=/srv/artifacts \
     FRAUDSHIELD_WARM_ROWS=0 \
@@ -46,6 +50,12 @@ EXPOSE 8000
 #   FRAUDSHIELD_COOKIE_SECURE   must be true behind HTTPS
 #   FRAUDSHIELD_WEBHOOK_SECRET  unset -> /v1/webhooks/payment refuses with 503
 # Still absent: email verification, password reset, MFA.
+#
+# PAYMENTS: this image runs the SIMULATED gateway by default. To use Razorpay Test
+# Mode set FRAUDSHIELD_PAYMENT_PROVIDER=razorpay plus RAZORPAY_KEY_ID and
+# RAZORPAY_KEY_SECRET, and install the SDK (`pip install razorpay`, which is NOT
+# in requirements-serve.txt). Without all three the service logs a DEGRADED
+# warning and keeps serving the simulator rather than failing every checkout.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"
 

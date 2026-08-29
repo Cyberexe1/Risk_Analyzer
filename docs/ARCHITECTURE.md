@@ -189,7 +189,7 @@ Single table, `fraudshield`, on-demand capacity. Key schema `PK` (partition) + `
 | Promo device counter | `PROMODEV#<fp>` | `<code>#<iso>#<customer_id>` | Written even on DENY, so a retry from a new account sees the history |
 | Promo IP counter | `PROMOIP#<hash>` | `<code>#<iso>#<customer_id>` | |
 | Payout destination | `PAYOUT#<ref>` | `<code>#<iso>#<customer_id>` | Powers payout-reuse detection. **Not** written on DENY — a denied claim never pays out, so blocking that destination forever would punish a legitimate retry |
-| Label | `LABEL#<txn_id>` | `OUTCOME` | `label`, `source` (`analyst` / `chargeback`), `decided_at`, `analyst_id` |
+| Label | *(not built as a separate item)* | — | The human label lives on the transaction record (`label`, `labelled_by`, `labelled_at`) and in the `OUTCOME_RECORDED` audit event. There is no `analyst_id` field anywhere: actor identity comes from the authenticated token only, and `POST …/outcome` returns 422 if a client tries to supply one. See README §21a |
 | Audit | `AUDIT#<yyyy-mm-dd>` | `<ts>#<event_id>` | `actor`, `action`, `target`, `before`, `after` |
 
 ### Global secondary indexes

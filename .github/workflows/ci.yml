@@ -1,0 +1,145 @@
+name: CI
+
+# WHAT THIS PROTECTS
+# ------------------
+# Two things that are easy to break silently and expensive to discover late:
+#
+#   1. Offline/online feature parity. tests/test_parity.py replays 99,419 rows and
+#      compares 2.19M feature values. Every metric in the README depends on the
+#      serving path computing exactly what training computed, and a drift there
+#      produces plausible numbers and no error message. That is precisely the bug
+#      class a human reviewer will not catch.
+#   2. The security boundary. Webhook signature verification, role enforcement,
+#      customer projections and the audit trail all have tests. A regression in any
+#      of them is a real vulnerability, not a cosmetic failure.
+#
+# NO SECRETS, NO EXTERNAL ACCOUNTS
+# --------------------------------
+# This workflow needs no credentials of any kind and must never be given any.
+# Everything runs against the simulated payment provider, a mocked Razorpay SDK
+# client, and in-memory stores:
+#
+#   FRAUDSHIELD_PAYMENT_PROVIDER  left unset -> simulated
+#   RAZORPAY_KEY_ID / _SECRET     never set  -> the adapter is only ever mocked
+#   FRAUDSHIELD_USERS_BACKEND     memory     -> no DynamoDB, no AWS, no billing
+#   AWS_*                         never set
+#
+# If a future job here starts needing a secret, that is the signal that a test has
+# begun depending on a real external service, which is a test-design problem rather
+# than a CI configuration problem.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  # Read-only. This workflow publishes nothing and deploys nothing, so it has no
+  # business holding write access to the repository.
+  contents: read
+
+concurrency:
+  # A new push supersedes an in-flight run on the same ref. The parity suites take
+  # minutes; queueing several of them for the same branch wastes time and tells
+  # nobody anything new.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    env:
+      # Bound at import time by backend.py, so they are set for the whole job
+      # rather than per step.
+      FRAUDSHIELD_USERS_BACKEND: memory
+      FRAUDSHIELD_WARM_ROWS: '0'
+      FRAUDSHIELD_DEV_SEED_STAFF: '0'
+      # Test-only values. Not secrets: they exist so the suites are not at the
+      # mercy of the ephemeral-secret fallbacks, and they grant access to nothing.
+      FRAUDSHIELD_JWT_SECRET: ci-only-jwt-secret-not-a-real-credential
+      FRAUDSHIELD_IP_PEPPER: ci-only-pepper-not-a-real-credential
+      # Deliberately the simulator. CI must never be able to reach a real gateway.
+      FRAUDSHIELD_PAYMENT_PROVIDER: simulated
+      # Deliberately the console email provider. CI must never send real mail, and
+      # with no recipients configured it has nowhere to send it anyway.
+      FRAUDSHIELD_EMAIL_PROVIDER: console
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: |
+            requirements-serve.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-serve.txt -r requirements-dev.txt
+          pip install pytest
+
+      - name: Confirm no payment-provider credentials are present
+        # A guard, not a formality. If a credential ever leaks into the
+        # environment, the suite would start exercising a real provider and this
+        # job's "all green" would stop meaning what it says.
+        run: |
+          python - <<'PY'
+          import os, sys
+          leaked = [k for k in ("RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET",
+                                "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                                "FRAUDSHIELD_SMTP_PASSWORD",
+                                "FRAUDSHIELD_SMTP_HOST",
+                                "FRAUDSHIELD_ALERT_RECIPIENTS")
+                    if os.environ.get(k)]
+          if leaked:
+              sys.exit(f"refusing to run: {', '.join(leaked)} is set in CI")
+          print("no provider, cloud or mail credentials in the environment - correct")
+          PY
+
+      - name: Import check
+        # Fails fast and with a readable error if a module-level import broke,
+        # rather than reporting it as 300 collection errors.
+        run: python -c "import backend, payments, notifications; print('imports ok')"
+
+      - name: Run the test suite
+        # The full suite, including both parity suites. They are the slow part
+        # (~13 minutes) and the reason this job has a generous timeout.
+        run: python -m pytest --no-header -q
+
+  frontend:
+    name: Frontend build and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        # `npm ci` rather than `npm install`: it installs exactly the lockfile and
+        # fails if package.json and the lock disagree, which is what makes a CI
+        # build reproducible.
+        run: npm ci
+
+      - name: Typecheck and build
+        # `npm run build` is `tsc -b && vite build`, so a type error fails the job.
+        run: npm run build
+
+      - name: Run tests
+        run: npm test

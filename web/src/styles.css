@@ -1114,3 +1114,55 @@ td.num, th.num { text-align: right; }
   background: var(--bg-soft);
   border: 1px solid var(--line-soft);
 }
+
+/* ---------- audit trail ---------- */
+/*
+ * AUTOMATED ACTION vs HUMAN OUTCOME.
+ *
+ * Colour is never the only signal: each chip also carries its full text label and
+ * a distinct glyph (circle / diamond / square), so the distinction survives
+ * greyscale, colour blindness and a screen reader. Getting this wrong would let a
+ * reader believe the model confirmed fraud, which it never does.
+ */
+.chip-automated {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  color: var(--accent);
+}
+.chip-human {
+  border-color: color-mix(in srgb, var(--review) 55%, var(--line));
+  color: var(--review);
+  font-weight: 600;
+}
+.chip-system {
+  border-color: var(--line);
+  color: var(--text-dim);
+}
+
+/* Active filter pill. `aria-pressed` carries the state for assistive tech; this is
+   only the visual echo of it. */
+.chip-on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface-2));
+}
+
+.code-block {
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-3);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  font-family: var(--mono);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+}
+
+/* Communication events. A distinct fourth category: an alert changed nothing
+   about a transaction, so it must not read as an automated action taken against
+   one. Text label and glyph carry the meaning; colour is only reinforcement. */
+.chip-communication {
+  border-color: color-mix(in srgb, var(--cyan) 50%, var(--line));
+  color: var(--cyan);
+}

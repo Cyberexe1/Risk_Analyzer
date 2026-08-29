@@ -22,3 +22,14 @@ argon2-cffi==23.1.0
 
 # DynamoDB user + record store (FRAUDSHIELD_USERS_BACKEND=dynamodb)
 boto3==1.40.35
+
+# OPTIONAL -- Razorpay Test Mode (FRAUDSHIELD_PAYMENT_PROVIDER=razorpay).
+#
+# Left commented on purpose. payments.RazorpayProvider imports the SDK lazily, the
+# same way DynamoUserStore imports boto3, so the default simulated provider needs
+# no Razorpay dependency at all. Uncomment ONLY if you have a Razorpay account and
+# test credentials:
+#
+#   pip install razorpay==1.4.2
+#
+# razorpay==1.4.2

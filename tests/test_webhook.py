@@ -92,10 +92,35 @@ def event(
     return raw, eid, pid
 
 
+@pytest.fixture(autouse=True)
+def _force_secret(monkeypatch):
+    """Bind the test secret on the module object, not just in os.environ.
+
+    backend.WEBHOOK_SECRET is read from the environment at IMPORT time. Under the
+    full suite, tests/test_parity.py imports backend first (alphabetical
+    collection), so by the time this module's os.environ assignment runs the
+    constant is already bound to whatever .env held -- every signature then
+    mismatched and 13 tests failed with 401, but only when run together.
+
+    Patching the attribute makes these tests independent of collection order.
+    """
+    monkeypatch.setattr(backend, "WEBHOOK_SECRET", SECRET)
+
+
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(backend.app) as c:
-        yield c
+    """Force in-memory stores, for the same import-order reason as the secret above.
+
+    Without this the suite writes webhook test transactions into a real DynamoDB
+    table whenever one is configured in .env.
+    """
+    prev = backend.USERS_BACKEND
+    backend.USERS_BACKEND = "memory"
+    try:
+        with TestClient(backend.app) as c:
+            yield c
+    finally:
+        backend.USERS_BACKEND = prev
 
 
 def post(client, raw: bytes, signature: str | None, event_id: str | None = None):
