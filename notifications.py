@@ -69,6 +69,11 @@ STATUS_SENT = "sent"
 STATUS_FAILED = "failed"
 STATUS_SUPPRESSED = "suppressed"      # deduplicated: a real event, not an error
 STATUS_SKIPPED = "skipped"            # nothing to send to
+# Rate limited by the caller's alert budget. A real, distinct event that was not
+# delivered because too many alerts had already gone out in the window. Recorded
+# rather than dropped: the evidence must survive even when the email does not, and
+# it is NOT a failure -- nothing malfunctioned.
+STATUS_THROTTLED = "throttled"
 
 # The only events that warrant waking a human. Deliberately short.
 #
@@ -509,6 +514,9 @@ def build_transaction_alert(*, event_type: str, record: dict,
 
 def build_suspicious_ip_alert(*, flag: dict, window_minutes: int,
                               threshold: int,
+                              method_window_hours: int = 2,
+                              method_threshold: int = 3,
+                              instruments: list[dict] | None = None,
                               console_url: str = "") -> tuple[str, str]:
     """Subject and body for a newly flagged address.
 
@@ -517,31 +525,88 @@ def build_suspicious_ip_alert(*, flag: dict, window_minutes: int,
     stored anywhere in this system, so there is nothing to reveal even if the
     mailbox is compromised -- and the fingerprint is what an analyst pastes into
     the console to pivot.
+
+    WHAT THE INSTRUMENT SECTION DELIBERATELY DOES NOT CONTAIN
+    --------------------------------------------------------
+    No card number, no CVV, no full UPI handle, no bank credential. Each declined
+    instrument appears as the reference the engine already stores -- an HMAC
+    fingerprint for cards and wallets, a masked display for humans. That is not a
+    reduced version of the evidence: the fingerprint is what actually answers "is
+    this the same card as the other four accounts?", which a PAN in a mailbox
+    would not answer any better and could not be un-leaked.
+
+    Retaining a CVV after authorisation is prohibited outright by PCI DSS 3.2, and
+    the value is discarded upstream in validate_instrument, so there is nothing
+    here to include even if it were wanted.
     """
     ip_hash = flag.get("ip_hash") or "(unknown)"
-    subject = f"[FraudShield] Address flagged for repeated declines - {ip_hash[:16]}"
-    body = (
-        "An address crossed the failed-payment threshold and has been flagged "
-        "for analyst attention.\n"
+    subject = f"[FraudShield] Suspicious IP detected - {ip_hash[:16]}"
+
+    rule = flag.get("rule") or "unknown"
+    methods = flag.get("failed_methods") or []
+    matched = []
+    if flag.get("matched_volume_rule"):
+        matched.append(f"VOLUME (>{threshold - 1} declines / {window_minutes} min)")
+    if flag.get("matched_breadth_rule"):
+        matched.append(f"BREADTH (>={method_threshold} methods / "
+                       f"{method_window_hours} h)")
+
+    lines = [
+        "An address crossed a failed-payment rule and has been flagged for "
+        "analyst attention.",
         "This is an OPERATIONAL flag. It is not part of the risk score and it "
-        "labels no transaction and no customer.\n"
-        f"\n"
-        f"Event:              {EVENT_SUSPICIOUS_IP}\n"
-        f"Address fingerprint: {ip_hash}\n"
-        f"  (HMAC-SHA256 with a server-side pepper. The raw IP address is never "
-        f"stored by FraudShield.)\n"
-        f"Failed attempts:    {flag.get('failures_total', '(unknown)')}\n"
-        f"Trigger:            {threshold} declines within {window_minutes} minutes\n"
-        f"Distinct accounts:  {flag.get('accounts', '(unknown)')}\n"
-        f"Flagged since:      {flag.get('since') or '(unknown)'}\n"
-        f"Reason:             {flag.get('reason') or '(unknown)'}\n"
-        f"\n"
+        "labels no transaction and no customer.",
+        "",
+        f"Event:               {EVENT_SUSPICIOUS_IP}",
+        f"Address fingerprint: {ip_hash}",
+        "  (HMAC-SHA256 with a server-side pepper. The raw IP address is never "
+        "stored by FraudShield.)",
+        f"Rule that fired:     {rule.upper()}",
+        f"Rules matched now:   {'; '.join(matched) or '(none)'}",
+        f"Declines in window:  {flag.get('failures_in_window', '(unknown)')} "
+        f"(in the last {window_minutes} min)",
+        f"Declines all time:   {flag.get('failures_total', '(unknown)')}",
+        f"Methods failed:      {flag.get('failed_method_count', 0)}"
+        + (f"  ({', '.join(methods)})" if methods else ""),
+        f"Distinct accounts:   {flag.get('accounts', '(unknown)')}",
+        f"Flagged since:       {flag.get('since') or '(unknown)'}",
+        f"Reason:              {flag.get('reason') or '(unknown)'}",
+        "",
+        "Detection rules, either sufficient:",
+        f"  VOLUME   more than {threshold - 1} declines within {window_minutes} "
+        f"minutes",
+        f"  BREADTH  {method_threshold} or more distinct payment methods failing "
+        f"within {method_window_hours} hours",
+    ]
+
+    if instruments:
+        lines += [
+            "",
+            f"Instruments declined from this address ({len(instruments)}):",
+        ]
+        for inst in instruments[:12]:
+            lines.append(
+                f"  {str(inst.get('payment_method') or '?'):<11} "
+                f"{str(inst.get('instrument_display') or '(no display)'):<26} "
+                f"{inst.get('instrument_ref') or '(no ref)'}"
+            )
+        if len(instruments) > 12:
+            lines.append(f"  ... and {len(instruments) - 12} more")
+        lines += [
+            "",
+            "The reference is an HMAC fingerprint for cards and wallets, so the "
+            "same card used on another account produces the same value and can be "
+            "correlated without the number ever being stored. No card number, CVV "
+            "or bank credential appears in this message or in the database.",
+        ]
+
+    lines += [
+        "",
         "Evidence available to analysts: every individual declined attempt from "
         "this address is stored and viewable, including amount, method, "
-        "instrument fingerprint and the risk decision at the time.\n"
-        + _footer(console_url, "/admin")
-    )
-    return subject, body
+        "instrument fingerprint and the risk decision at the time.",
+    ]
+    return subject, "\n".join(lines) + _footer(console_url, "/admin")
 
 
 def build_promo_hold_alert(*, redemption: dict,

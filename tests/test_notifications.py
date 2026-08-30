@@ -609,13 +609,45 @@ def test_suspicious_ip_alert_uses_the_fingerprint_not_a_raw_address():
     flag = {"ip_hash": "ip_9f2a1c", "failures_total": 4, "accounts": 2,
             "since": "2026-08-27T10:00:00+00:00", "reason": "4 declines"}
     subject, body = nf.build_suspicious_ip_alert(
-        flag=flag, window_minutes=60, threshold=3)
+        flag=flag, window_minutes=20, threshold=10)
     assert "ip_9f2a1c" in subject and "ip_9f2a1c" in body
     assert "raw IP address is never stored" in body
-    assert "3 declines within 60 minutes" in body
+    # Both rules are stated, so a reader knows which detectors exist without
+    # consulting the code.
+    assert "more than 9 declines within 20 minutes" in body
+    assert "distinct payment methods failing within 2 hours" in body
     assert "labels no transaction and no customer" in body
     # No dotted quad anywhere.
     assert not re.search(r"\b\d{1,3}(\.\d{1,3}){3}\b", body)
+
+
+def test_suspicious_ip_alert_lists_instruments_without_card_data():
+    """The evidence an analyst needs to pivot, and nothing a mailbox must not hold.
+
+    A fingerprint answers "is this the same card as the other four accounts?".
+    A PAN would answer it no better and could not be un-leaked, and retaining a
+    CVV after authorisation is prohibited outright.
+    """
+    flag = {"ip_hash": "ip_9f2a1c", "failures_total": 11, "accounts": 3,
+            "since": "2026-08-27T10:00:00+00:00", "reason": "11 declines",
+            "rule": "volume", "matched_volume_rule": True,
+            "failed_methods": ["card", "upi"], "failed_method_count": 2}
+    instruments = [
+        {"payment_method": "card", "instrument_display": "Visa \u2022\u2022\u2022\u2022 4242",
+         "instrument_ref": "card_9a8b7c6d5e4f3a2b1c0d9e8f"},
+        {"payment_method": "upi", "instrument_display": "someone@okhdfcbank",
+         "instrument_ref": "upi_someone@okhdfcbank"},
+    ]
+    _subject, body = nf.build_suspicious_ip_alert(
+        flag=flag, window_minutes=20, threshold=10, instruments=instruments)
+
+    assert "card_9a8b7c6d5e4f3a2b1c0d9e8f" in body
+    assert "Visa \u2022\u2022\u2022\u2022 4242" in body
+    assert "Instruments declined from this address (2)" in body
+    assert "No card number, CVV" in body
+    # Nothing resembling a full PAN, and no CVV field.
+    assert not re.search(r"\b\d{13,19}\b", body)
+    assert "cvv" not in body.lower().replace("cvv or bank credential", "")
 
 
 def test_promo_hold_alert_omits_the_payout_destination():
@@ -941,7 +973,7 @@ def test_a_decline_burst_from_one_address_sends_one_ip_alert(db, pinned_scorer):
             h = register(c, f"burst{i}-{uuid.uuid4().hex[:8]}@example.com")
             order(c, h, P_BLOCK)
         ip_alerts = [m for m in sent_messages()
-                     if "Address flagged" in m.subject]
+                     if "Suspicious IP detected" in m.subject]
 
         assert len(ip_alerts) == 1, \
             f"burst produced {len(ip_alerts)} address alerts"

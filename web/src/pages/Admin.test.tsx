@@ -45,7 +45,12 @@ const HEALTH: Health = {
 }
 
 function user(role: PublicUser['role']): PublicUser {
-  return { user_id: 'u1', email: `${role}@example.com`, role }
+  return {
+    user_id: 'u1',
+    email: `${role}@example.com`,
+    role,
+    created_at: '2026-08-01T00:00:00+00:00',
+  }
 }
 
 function stub(role: PublicUser['role'], health: Health = HEALTH) {

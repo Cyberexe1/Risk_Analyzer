@@ -6,8 +6,9 @@
  * local demo can reach the local backend.
  *
  * In production the browser must never hold the backend key. Put a
- * session-authenticated server in front, or implement the JWT flow in
- * docs/ARCHITECTURE.md section 4 and drop the shared key.
+ * session-authenticated server in front, or route these calls through the
+ * existing JWT flow (`/v1/auth/*`, already used for every other request here)
+ * and drop the shared key.
  */
 
 const BASE: string = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
@@ -450,6 +451,13 @@ export interface SuspiciousIp extends IpFlag {
   attempts: FailedAttempt[]
   attempt_count: number
   accounts_involved: string[]
+  /** Which rule raised this address: `volume` or `breadth`. Null on records
+   *  flagged before the second rule existed, and on persisted records whose
+   *  stored item predates the field — so the console renders "—" rather than
+   *  asserting a rule it does not know. */
+  rule?: string | null
+  failed_methods?: string[]
+  failed_method_count?: number
 }
 
 export interface ReturnRecord {
@@ -939,8 +947,19 @@ export const api = {
   suspiciousIps: () =>
     req<{
       count: number
+      /** Volume rule. Fires above `threshold - 1` declines in `window_minutes`. */
       threshold: number
       window_minutes: number
+      /** Breadth rule. Optional because an older backend publishes only the
+       *  volume pair, and the console must render rather than show "undefined". */
+      method_threshold?: number
+      method_window_hours?: number
+      rules?: {
+        name: string
+        description: string
+        threshold: number
+        window_minutes: number
+      }[]
       items: SuspiciousIp[]
     }>('/v1/admin/suspicious-ips'),
   failedAttempts: () =>
@@ -986,6 +1005,11 @@ export const AUDIT_ACTIONS = [
   // investigating a real incident needs to be able to separate demo runs from it,
   // and the individual synthetic RISK_DECISIONs carry `demo: true` in `after`.
   { action: 'DEMO_ATTACK_TRIGGERED', label: 'Demo attack', kind: 'human' },
+  // Withheld by the alert volume ceiling. A communication event like the other
+  // two, and deliberately not folded into NOTIFICATION_FAILED: nothing broke, the
+  // alert was held back by policy. An analyst chasing a mail outage needs to be
+  // able to tell those apart.
+  { action: 'NOTIFICATION_THROTTLED', label: 'Alert throttled', kind: 'communication' },
 ] as const
 
 export type AuditKind = 'automated' | 'human' | 'communication' | 'system'

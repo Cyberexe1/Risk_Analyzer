@@ -27,8 +27,8 @@ PARITY WARNING -- read before refactoring
 `build_online_features()` in section 3 is an INDEPENDENT reimplementation of the
 forward pass in ml/generate_dataset.py::compute_features. The two look similar on
 purpose. tests/test_parity.py proves they agree across 2.1M feature comparisons,
-and that agreement is the only evidence that the metrics in docs/EVALUATION.md
-describe a model that can actually ship.
+and that agreement is the only evidence that the metrics in
+ml/artifacts/metrics.json describe a model that can actually ship.
 
 If you "deduplicate" these two into a shared helper, the test will still pass and
 will prove nothing -- a function equalling itself. Leave them separate.
@@ -37,8 +37,8 @@ will prove nothing -- a function equalling itself. Leave them separate.
 SECURITY -- read before exposing this service
 ---------------------------------------------
 Guarded by a single shared API key (`FRAUDSHIELD_API_KEY`). That is NOT the auth
-model docs/ARCHITECTURE.md section 4 specifies (JWT access + refresh, Argon2id
-credentials in DynamoDB, per-route role gating). Missing today:
+model the browser-facing routes use (JWT access + refresh, Argon2id credentials in
+DynamoDB, per-route role gating -- all implemented below). Missing today:
 
   - no per-user identity; nothing distinguishes one caller from another
   - no roles, so no analyst/admin separation
@@ -247,8 +247,7 @@ def ip_hash_of(request: "Request") -> str:
     """HMAC-SHA256(ip, pepper), truncated.
 
     Raw addresses are never stored, so counters work but a table dump does not
-    reveal who connected from where. Matches the guarantee in
-    docs/ARCHITECTURE.md section 3.
+    reveal who connected from where.
     """
     ip = client_ip(request)
     mac = hmac.new(IP_PEPPER.encode(), ip.encode(), hashlib.sha256).hexdigest()
@@ -360,8 +359,8 @@ def assert_no_leakage(feature_names: list[str]) -> None:
 # The offline pipeline computes features in one chronological pass over a sorted
 # file. Production has no sorted file -- it has one transaction and whatever
 # counters earlier traffic left behind. If those two paths disagree, every metric
-# in docs/EVALUATION.md describes a model that cannot ship. tests/test_parity.py
-# is what checks that.
+# in ml/artifacts/metrics.json describes a model that cannot ship.
+# tests/test_parity.py is what checks that.
 
 
 class RunningHour:
@@ -436,8 +435,30 @@ class DeviceState:
 # So the trigger is a count inside a window, not a lifetime total. Without the
 # window a legitimate customer who mistypes a card three times over six months is
 # eventually indistinguishable from an attacker.
-IP_FAIL_WINDOW = 3600.0
-IP_FAIL_THRESHOLD = 3
+#
+# TWO RULES, TWO WINDOWS -- because the same attack has a fast and a slow form.
+#
+#   VOLUME    more than 9 failures inside 20 minutes.
+#             A machine working a list. Nobody types ten declining payments in
+#             twenty minutes by hand.
+#
+#   BREADTH   3 or more DISTINCT payment methods failing inside 2 hours.
+#             The patient version: card, then UPI, then netbanking, spread out
+#             enough to stay under the volume rule. The long window is the point --
+#             a burst detector cannot see this at all.
+#
+# Either fires the flag. They are deliberately not combined with AND: an attacker
+# only has to be caught by one.
+#
+# WHY BREADTH IS 3 AND NOT 2. Two methods failing is an ordinary bad afternoon --
+# an expired card followed by a UPI app that is having problems. Three distinct
+# instrument TYPES failing from one address is someone working through whatever
+# they have. Set IP_METHOD_THRESHOLD = 2 for the literal reading of "multiple";
+# it will flag noticeably more honest customers.
+IP_FAIL_WINDOW = 1200.0          # 20 minutes
+IP_FAIL_THRESHOLD = 10           # fires at 10, i.e. MORE than 9
+IP_METHOD_WINDOW = 7200.0        # 2 hours
+IP_METHOD_THRESHOLD = 3          # distinct failed methods
 
 
 @dataclass
@@ -448,8 +469,16 @@ class IPState:
     # evaluate_ip_suspicion for why this stays out of the scoring path.
     n_fail: int = 0
     failures: deque = field(default_factory=deque)
+    # (ts, payment_method) per failed authorisation, trimmed to IP_METHOD_WINDOW.
+    # Kept separately from `failures` because the two rules read different windows:
+    # trimming one deque to 20 minutes would destroy the 2-hour breadth count, the
+    # same trap the customer velocity deques already document.
+    method_failures: deque = field(default_factory=deque)
     suspicious_at: float | None = None
     suspicious_reason: str = ""
+    # Which rule fired, so the alert and the console can say WHY rather than
+    # leaving an analyst to infer it from a count.
+    suspicious_rule: str = ""
 
 
 class Store(Protocol):
@@ -568,6 +597,7 @@ class InMemoryStore:
         if failed:
             p.n_fail += 1
             p.failures.append(ts)
+            p.method_failures.append((ts, ev["payment_method"]))
 
         self.acct_devices[cid].add(dev)
         self.acct_ips[cid].add(ipa)
@@ -592,7 +622,7 @@ class InMemoryStore:
     # ---- failed-payment tracking -------------------------------------------
     #
     # Deliberately NOT wired into build_online_features. Adding a 23rd feature
-    # would invalidate every number in docs/EVALUATION.md, because the model was
+    # would invalidate every number in ml/artifacts/metrics.json, because the model was
     # trained and measured on 22. This is an operational signal for analysts, and
     # promoting it into the score is a retrain, not an edit.
 
@@ -603,13 +633,35 @@ class InMemoryStore:
             p.failures.popleft()
         return len(p.failures)
 
+    def ip_failed_methods_recent(self, h: str, now: float,
+                                 window: float = IP_METHOD_WINDOW) -> set[str]:
+        """Distinct payment methods that FAILED from this address in the window.
+
+        The breadth signal. One customer whose card keeps declining produces a
+        single method however many times they retry; somebody working through a
+        card, then a UPI handle, then a bank produces three.
+        """
+        p = self._ip[h]
+        while p.method_failures and now - p.method_failures[0][0] > window:
+            p.method_failures.popleft()
+        return {m for _ts, m in p.method_failures}
+
     def ip_is_suspicious(self, h: str) -> bool:
         return self._ip[h].suspicious_at is not None
 
     def evaluate_ip_suspicion(self, h: str, now: float) -> dict | None:
-        """Flag an address once its recent declines cross the threshold.
+        """Flag an address once either decline rule crosses its threshold.
 
         Returns the mark when one is newly applied or already standing, else None.
+
+        TWO RULES, EITHER SUFFICIENT:
+          VOLUME   > 9 failures inside IP_FAIL_WINDOW (20 min) -- a fast burst.
+          BREADTH  >= 3 distinct methods failing inside IP_METHOD_WINDOW (2 h) --
+                   the same attack run slowly enough to duck the volume rule.
+
+        Both counters are always evaluated, even once the address is already
+        flagged, because the console and the alert report the live numbers rather
+        than the ones that happened to trip the flag first.
 
         Shared infrastructure is exempt: a mobile carrier NAT or an office range
         legitimately carries many unrelated accounts, and their declines pool at
@@ -619,17 +671,34 @@ class InMemoryStore:
         """
         p = self._ip[h]
         recent = self.ip_failures_recent(h, now)
-        if recent < IP_FAIL_THRESHOLD:
+        methods = self.ip_failed_methods_recent(h, now)
+
+        by_volume = recent >= IP_FAIL_THRESHOLD
+        by_breadth = len(methods) >= IP_METHOD_THRESHOLD
+        if not (by_volume or by_breadth):
             return None
         if len(p.accounts) > HIGH_POP_IP_ACCOUNTS:
             return None
+
         newly = p.suspicious_at is None
         if newly:
             p.suspicious_at = now
-            p.suspicious_reason = (
-                f"{recent} failed payment attempts within "
-                f"{int(IP_FAIL_WINDOW // 60)} minutes"
-            )
+            # Volume is named first when both are true: it is the stronger claim,
+            # and an analyst reading "11 failures in 20 minutes" needs no further
+            # explanation of why this address was raised.
+            if by_volume:
+                p.suspicious_rule = "volume"
+                p.suspicious_reason = (
+                    f"{recent} failed payment attempts within "
+                    f"{int(IP_FAIL_WINDOW // 60)} minutes"
+                )
+            else:
+                p.suspicious_rule = "breadth"
+                p.suspicious_reason = (
+                    f"{len(methods)} different payment methods failed "
+                    f"({', '.join(sorted(methods))}) within "
+                    f"{int(IP_METHOD_WINDOW // 3600)} hours"
+                )
         return {
             # True only on the transition. Callers audit on `new` so an address
             # that keeps failing does not write an audit entry per attempt --
@@ -638,7 +707,12 @@ class InMemoryStore:
             "ip_hash": h,
             "since": datetime.fromtimestamp(p.suspicious_at, tz=timezone.utc).isoformat(),
             "reason": p.suspicious_reason,
+            "rule": p.suspicious_rule,
             "failures_in_window": recent,
+            "failed_methods": sorted(methods),
+            "failed_method_count": len(methods),
+            "matched_volume_rule": by_volume,
+            "matched_breadth_rule": by_breadth,
             "failures_total": p.n_fail,
             "accounts": len(p.accounts),
         }
@@ -652,6 +726,12 @@ class InMemoryStore:
                 "ip_hash": h,
                 "since": datetime.fromtimestamp(p.suspicious_at, tz=timezone.utc).isoformat(),
                 "reason": p.suspicious_reason,
+                # Which rule raised this address. Absent on records flagged before
+                # the second rule existed, which is why the console must tolerate
+                # null rather than assume it.
+                "rule": p.suspicious_rule or None,
+                "failed_methods": sorted({m for _ts, m in p.method_failures}),
+                "failed_method_count": len({m for _ts, m in p.method_failures}),
                 "failures_total": p.n_fail,
                 "accounts": len(p.accounts),
                 "transactions": p.n_txn,
@@ -829,9 +909,8 @@ HIGH_POP_IP_ACCOUNTS = 25   # above this, an IP is shared infrastructure
 MAX_COMPONENT = 200
 
 # Defaults chosen on the validation split by expected-cost minimisation under an
-# analyst-capacity ceiling. See docs/EVALUATION.md section 5 -- the review
-# threshold is an OPERATIONS parameter (how many analysts you employ), not a
-# property of the model.
+# analyst-capacity ceiling. See README section 20 -- the review threshold is an
+# OPERATIONS parameter (how many analysts you employ), not a property of the model.
 DEFAULT_REVIEW_T = float(os.environ.get("FRAUDSHIELD_REVIEW_T", "5"))
 DEFAULT_BLOCK_T = float(os.environ.get("FRAUDSHIELD_BLOCK_T", "70"))
 
@@ -1288,9 +1367,8 @@ def email_stem_similarity(email: str, others: list[str]) -> float:
 # 5. Authentication
 # =============================================================================
 #
-# Implements docs/ARCHITECTURE.md section 4: Argon2id credentials, short-lived
-# JWT access tokens, rotating opaque refresh tokens with family revocation, and
-# per-route role gating.
+# Argon2id credentials, short-lived JWT access tokens, rotating opaque refresh
+# tokens with family revocation, and per-route role gating. See README section 23.
 #
 # What is real:
 #   - Argon2id hashing, per-user salt, parameters versioned in the hash string
@@ -1441,7 +1519,7 @@ class InMemoryUserStore:
 
 
 class DynamoUserStore:
-    """Single-table adapter matching docs/ARCHITECTURE.md section 3.
+    """Single-table adapter; item shapes are documented in README section 17.
 
     OFF BY DEFAULT. Enabling it creates and writes real AWS resources.
     Create the table first:
@@ -2501,7 +2579,11 @@ def validate_instrument(req: "OrderRequest") -> tuple[str, str]:
         mac = hmac.new(IP_PEPPER.encode(), phone.encode(), hashlib.sha256).hexdigest()
         return f"wal_{mac[:20]}", f"{req.wallet.provider} \u2022\u2022\u2022{phone[-4:]}"
 
-    return "cod", "Cash on delivery"
+    # Unreachable through /v1/orders, whose pattern already rejects anything not
+    # listed above. Kept as a refusal rather than a default so a future method
+    # added to the pattern without a branch here fails loudly instead of being
+    # silently recorded as an instrument-less order.
+    raise HTTPException(422, f"Unsupported payment method {m!r}.")
 
 
 def simulate_authorisation(method: str, amount: float, decision: str) -> str:
@@ -3043,6 +3125,11 @@ def audit_promo_override(
 # recording an outcome.
 NOTIFICATION_SENT = "NOTIFICATION_SENT"
 NOTIFICATION_FAILED = "NOTIFICATION_FAILED"
+# A distinct action, deliberately NOT folded into NOTIFICATION_FAILED. Nothing
+# malfunctioned: the alert was withheld because the volume ceiling had been reached,
+# which is a policy outcome. Recording it as a failure would put an operator on a
+# hunt for a broken mail server, and would bury real transport failures in noise.
+NOTIFICATION_THROTTLED = "NOTIFICATION_THROTTLED"
 
 NOTIFICATION_NOTE = (
     "Communication event. Records that an alert about an existing decision was "
@@ -3066,21 +3153,20 @@ def audit_notification(*, notification_id: str, event_type: str, result,
     not?" -- and nothing that would help an attacker enumerate the analyst team
     or replay a credential.
     """
-    failed = result.status != notifications.STATUS_SENT
-    return audit(
-        actor="system:notifier",
-        action=NOTIFICATION_FAILED if failed else NOTIFICATION_SENT,
-        event_id=notification_id,
-        before={
-            "notification_id": notification_id,
-            "event_type": event_type,
-            "dedupe_key": dedupe_key,
-            "subject_id": subject_id,
-            # Which transaction / redemption / address this alert was about, so an
-            # auditor can join the communication back to the decision.
-            **{k: v for k, v in related.items() if v is not None},
-        },
-        after={
+    if result.status == notifications.STATUS_THROTTLED:
+        action = NOTIFICATION_THROTTLED
+    elif result.status == notifications.STATUS_SENT:
+        action = NOTIFICATION_SENT
+    else:
+        action = NOTIFICATION_FAILED
+    # The synthetic-activity marker travels in `related`, but it belongs in
+    # `after` next to `is_ground_truth`, which is where RISK_DECISION carries it.
+    # An auditor filtering for demo activity must not have to look in two places.
+    demo = bool(related.get("demo"))
+    demo_scenario = related.get("demo_scenario")
+    subject = {k: v for k, v in related.items()
+               if v is not None and k not in ("demo", "demo_scenario")}
+    after = {
             "status": result.status,
             "provider": result.provider,
             # Count, never addresses.
@@ -3089,7 +3175,25 @@ def audit_notification(*, notification_id: str, event_type: str, result,
             # Machine-checkable, matching RISK_DECISION's field of the same name.
             "is_ground_truth": False,
             "note": NOTIFICATION_NOTE,
+    }
+    if demo:
+        after["demo"] = True
+        after["demo_scenario"] = demo_scenario
+
+    return audit(
+        actor="system:notifier",
+        action=action,
+        event_id=notification_id,
+        before={
+            "notification_id": notification_id,
+            "event_type": event_type,
+            "dedupe_key": dedupe_key,
+            "subject_id": subject_id,
+            # Which transaction / redemption / address this alert was about, so an
+            # auditor can join the communication back to the decision.
+            **subject,
         },
+        after=after,
     )
 
 
@@ -3158,6 +3262,52 @@ def notify(event_type: str, *, subject_id: str, subject: str, body: str,
         return None
 
 
+# Alert volume ceiling. Five alerts per ten minutes, counted across every event
+# type: a burst of transaction blocks and a suspicious-address flag draw from the
+# same budget, because they arrive in the same mailbox.
+#
+# Chosen to be readable rather than clever. Five is enough that a genuine incident
+# still produces a visible cluster, and low enough that a card-testing run cannot
+# bury the one alert an analyst most needs to see.
+ALERT_RATE_MAX = 5
+ALERT_RATE_WINDOW = 600.0        # 10 minutes
+
+
+# Event types the ceiling does NOT apply to.
+#
+# THE FAILURE THIS PREVENTS, found by a test rather than by inspection:
+# a card-testing burst produces one transaction alert per declined payment, and
+# those arrive BEFORE the address has crossed its decline threshold. So the
+# per-transaction noise consumed the whole budget and the suspicious-address alert
+# -- the one message that summarises the entire attack -- was throttled. The cap
+# existed to stop noise burying the important alert and was doing the opposite.
+#
+# Exempt because it cannot flood on its own: SUSPICIOUS_IP is deduplicated to one
+# alert per address for the life of the flag, so the number of these is bounded by
+# distinct addresses crossing a threshold, not by traffic volume.
+ALERT_RATE_EXEMPT = (notifications.EVENT_SUSPICIOUS_IP,)
+
+
+def _alert_budget_available(event_type: str) -> bool:
+    """Whether an alert may be sent now. Trims the window as a side effect.
+
+    Called once per candidate alert, immediately before the send is claimed, so
+    the count reflects deliveries ATTEMPTED rather than events considered.
+
+    Exempt event types neither consume budget nor are blocked by it.
+    """
+    if event_type in ALERT_RATE_EXEMPT:
+        return True
+    now = time.time()
+    sent: deque = STATE.setdefault("alert_times", deque())
+    while sent and now - sent[0] > ALERT_RATE_WINDOW:
+        sent.popleft()
+    if len(sent) >= ALERT_RATE_MAX:
+        return False
+    sent.append(now)
+    return True
+
+
 def _notify(event_type: str, *, subject_id: str, subject: str, body: str,
             related: dict) -> dict | None:
     provider = STATE.get("email_provider")
@@ -3184,6 +3334,72 @@ def _notify(event_type: str, *, subject_id: str, subject: str, body: str,
         seen.add(key)
         return {**existing, "status": notifications.STATUS_SUPPRESSED,
                 "duplicate": True}
+
+    # ---- rate limit ------------------------------------------------------
+    #
+    # A cap on how many alerts leave the process in a rolling window, on top of
+    # deduplication. Dedup answers "is this the same event twice?"; this answers
+    # "is anyone going to read the 40th distinct alert this minute?"
+    #
+    # Deliberately NOT silent. A rate-limited alert is recorded with status
+    # `throttled` and its own audit event, so the alert still exists as evidence
+    # even though no email was sent. Dropping it quietly would mean the
+    # notification log implied nothing happened.
+    #
+    # ORDERED AFTER THE RECIPIENT CHECK, and that ordering is load-bearing. With
+    # no recipients configured there is no delivery to ration, so throttling first
+    # would spend budget on alerts that were never going to be sent and would
+    # record "withheld by volume" for a system where alerting is simply off. A test
+    # caught this: an unrelated suite with no recipients started producing
+    # NOTIFICATION_THROTTLED events attached to its transactions.
+    #
+    # This is a per-process counter, not a distributed one. Two instances would
+    # each allow ALERT_RATE_MAX, which is the honest limitation of keeping it in
+    # memory; it is a mailbox-volume control, not a security boundary.
+    recipients_now = STATE.get("email_recipients") or ()
+    if recipients_now and not _alert_budget_available(event_type):
+        item = {
+            "notification_id": f"ntf_{uuid.uuid4().hex[:12]}",
+            "event_type": event_type,
+            "dedupe_key": key,
+            "subject_id": subject_id,
+            "recipient_count": len(STATE.get("email_recipients") or ()),
+            "provider": getattr(provider, "provider_name", "unknown"),
+            "status": notifications.STATUS_THROTTLED,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "sent_at": None,
+            "error": (f"rate limit reached: {ALERT_RATE_MAX} alerts per "
+                      f"{int(ALERT_RATE_WINDOW // 60)} minutes"),
+            "error_category": "rate_limited",
+            "attempts": 0,
+            **{k: v for k, v in related.items() if v is not None},
+        }
+        # NOT added to `seen`: a throttled alert was never delivered, so the same
+        # event must remain eligible once the window clears. Suppressing it
+        # permanently would turn a volume control into silent alert loss.
+        _persist_notification(item)
+        # Audited, because the withheld alert is still evidence that the situation
+        # occurred. An audit trail that recorded only the alerts that happened to
+        # fit inside the ceiling would under-report the incident it exists to
+        # document.
+        try:
+            audit_notification(
+                notification_id=item["notification_id"], event_type=event_type,
+                result=notifications.SendResult(
+                    provider=item["provider"],
+                    status=notifications.STATUS_THROTTLED,
+                    recipient_count=item["recipient_count"],
+                    error=item["error"], error_category="rate_limited"),
+                dedupe_key=key, subject_id=subject_id, related=related)
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: could not audit a throttled alert "
+                  f"({type(exc).__name__}); the notification record is still "
+                  f"present")
+        print(f"NOTE: alert {event_type}:{subject_id} was rate limited "
+              f"({ALERT_RATE_MAX} per {int(ALERT_RATE_WINDOW // 60)} min). It is "
+              f"recorded with status={notifications.STATUS_THROTTLED} and remains "
+              f"visible in the notification log.")
+        return item
 
     # Claimed BEFORE sending. If the send hangs and the request is retried, the
     # retry is suppressed rather than sending a second copy -- the failure mode
@@ -3318,7 +3534,12 @@ def notify_transaction(record: dict) -> dict | None:
                            "order_id": record.get("order_id"),
                            "decision": decision,
                            "risk_score": record.get("risk_score"),
-                           "amount": record.get("amount")})
+                           "amount": record.get("amount"),
+                           # Propagated from the record, never invented here. None
+                           # on real traffic, and `related` drops None, so a real
+                           # alert carries no marker at all.
+                           "demo": record.get("demo"),
+                           "demo_scenario": record.get("demo_scenario")})
 
 
 def notify_suspicious_ip(flag: dict) -> dict | None:
@@ -3334,11 +3555,61 @@ def notify_suspicious_ip(flag: dict) -> dict | None:
     subject, body = notifications.build_suspicious_ip_alert(
         flag=flag, window_minutes=int(IP_FAIL_WINDOW // 60),
         threshold=IP_FAIL_THRESHOLD,
+        method_window_hours=int(IP_METHOD_WINDOW // 3600),
+        method_threshold=IP_METHOD_THRESHOLD,
+        instruments=_declined_instruments(ip_hash),
         console_url=STATE.get("console_url", ""))
     return notify(notifications.EVENT_SUSPICIOUS_IP, subject_id=ip_hash,
                   subject=subject, body=body,
                   related={"ip_hash": ip_hash,
-                           "failures_total": flag.get("failures_total")})
+                           "failures_total": flag.get("failures_total"),
+                           "rule": flag.get("rule"),
+                           "failed_method_count": flag.get("failed_method_count"),
+                           "demo": flag.get("demo"),
+                           "demo_scenario": flag.get("demo_scenario")})
+
+
+def _declined_instruments(ip_hash: str) -> list[dict]:
+    """The distinct instruments that failed from one address, newest first.
+
+    Read from the IPFAIL# attempt records that create_order already writes, so
+    this adds no new storage and no new field. Each entry carries only what those
+    records hold: the method, the masked display, and the HMAC reference.
+
+    Deliberately absent, because it is absent from the records too: the card
+    number, the CVV and any bank credential. `validate_instrument` reduces a card
+    to a fingerprint and discards the digits before an attempt is ever stored.
+
+    Never raises. An alert that cannot list instruments is still worth sending.
+    """
+    records = STATE.get("records")
+    if records is None:
+        return []
+    try:
+        rows = records.query_prefix(f"IPFAIL#{ip_hash}", "ATTEMPT#")
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNING: could not read declined instruments for an alert "
+              f"({type(exc).__name__}); the alert is sent without them")
+        return []
+
+    rows.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    seen: set[str] = set()
+    out: list[dict] = []
+    for r in rows:
+        ref = str(r.get("instrument_ref") or "")
+        # Deduplicated on the reference: one card retried nine times is one
+        # instrument, and listing it nine times would hide the breadth the alert
+        # exists to show.
+        if ref and ref in seen:
+            continue
+        if ref:
+            seen.add(ref)
+        out.append({
+            "payment_method": r.get("payment_method"),
+            "instrument_display": r.get("instrument_display"),
+            "instrument_ref": ref or None,
+        })
+    return out
 
 
 def notify_promo_hold(redemption: dict) -> dict | None:
@@ -4162,7 +4433,17 @@ class OrderRequest(BaseModel):
     """
 
     items: list[CartLine] = Field(min_length=1, max_length=20)
-    payment_method: str = Field(pattern="^(upi|card|netbanking|wallet|cod)$")
+    # `cod` is deliberately NOT accepted any more. Cash on delivery carries no
+    # instrument to fingerprint, so it produces no card/UPI/wallet reuse signal and
+    # cannot be declined by a gateway -- it was the one method the risk engine had
+    # nothing to say about.
+    #
+    # Note it REMAINS in PAYMENT_METHODS and in feature_spec.json. The model was
+    # trained with a `method_cod` one-hot column, so deleting it there would change
+    # the feature matrix out from under the artifact and break offline/online
+    # parity. Historical COD transactions still score correctly; new ones are simply
+    # not offered.
+    payment_method: str = Field(pattern="^(upi|card|netbanking|wallet)$")
     device_fp: str = Field(min_length=3, max_length=128)
     card: CardDetails | None = None
     upi: UpiDetails | None = None
@@ -4185,7 +4466,6 @@ def catalog() -> dict:
             {"code": "card", "label": "Card", "needs": "card"},
             {"code": "netbanking", "label": "Netbanking", "needs": "bank"},
             {"code": "wallet", "label": "Wallet", "needs": "wallet"},
-            {"code": "cod", "label": "Cash on delivery", "needs": None},
         ],
         "banks": [{"code": k, "name": v} for k, v in BANKS.items()],
         "wallets": WALLETS,
@@ -4485,7 +4765,7 @@ def request_return(req: ReturnRequest, u: User = Depends(current_user)) -> dict:
                               {"return_status": "under_review"})
 
     # Every return goes to a human. Return abuse recall is 0.455 at payment time
-    # (docs/EVALUATION.md section 3), so auto-approving on the transaction score
+    # (ml/artifacts/metrics.json, per-archetype recall), so auto-approving on the score
     # would be approving on evidence we know is weak.
     return {"return_id": return_id, "status": "under_review",
             "message": "Return request received. We'll email you within 2 business days."}
@@ -5724,8 +6004,26 @@ def suspicious_ips(limit: int = 50) -> dict:
         it["attempt_count"] = len(rows)
         it["accounts_involved"] = sorted({r.get("email", "") for r in rows} - {""})
 
+    # `threshold` / `window_minutes` keep their existing names and meaning so no
+    # existing consumer breaks; `rules` is additive and describes both detectors,
+    # which a single threshold pair can no longer express on its own.
     return {"count": len(items), "threshold": IP_FAIL_THRESHOLD,
             "window_minutes": int(IP_FAIL_WINDOW // 60),
+            "method_threshold": IP_METHOD_THRESHOLD,
+            "method_window_hours": int(IP_METHOD_WINDOW // 3600),
+            "rules": [
+                {"name": "volume",
+                 "description": (f"more than {IP_FAIL_THRESHOLD - 1} declines "
+                                 f"within {int(IP_FAIL_WINDOW // 60)} minutes"),
+                 "threshold": IP_FAIL_THRESHOLD,
+                 "window_minutes": int(IP_FAIL_WINDOW // 60)},
+                {"name": "breadth",
+                 "description": (f"{IP_METHOD_THRESHOLD} or more distinct payment "
+                                 f"methods failing within "
+                                 f"{int(IP_METHOD_WINDOW // 3600)} hours"),
+                 "threshold": IP_METHOD_THRESHOLD,
+                 "window_minutes": int(IP_METHOD_WINDOW // 60)},
+            ],
             "items": items[:limit]}
 
 
@@ -5820,15 +6118,30 @@ DEMO_TRIGGERED = "DEMO_ATTACK_TRIGGERED"
 DEMO_ATTEMPTS = 8
 DEMO_SPACING_SECONDS = 60
 
-# Named so the operator running the demo can recognise the actor in the console at
-# a glance, and so nothing here can collide with real traffic. `ip_hash` is
-# normally an HMAC hex digest derived server-side from the connection, so a
-# `demo_ip_` prefix is not a value `ip_hash_of()` can ever produce -- the synthetic
-# address cannot be confused with, or collide with, a real one.
-DEMO_DEVICE_FP = "demo_shared_device_001"
-DEMO_IP_HASH = "demo_ip_shared_001"
-DEMO_HOME_DEVICE_FP = "demo_home_device_001"
-DEMO_HOME_IP_HASH = "demo_ip_home_001"
+# Prefixes, not fixed values. Every run mints its own device and address from one
+# token, so the run is self-contained.
+#
+# WHY THESE ARE NO LONGER CONSTANTS. They used to be, and repeated runs shared
+# them. That was deliberate -- the device's account count genuinely grew, so the
+# ring got denser each time -- but it had a consequence nobody wanted: the shared
+# device and address ARE model features (`device_account_count`, `ip_account_count`,
+# `device_failure_rate`), so by the third run the account looked more established,
+# some attempts scored under the block threshold, MANUAL_REVIEW attempts reached
+# the simulator and mostly SUCCEEDED, and the address then never accumulated three
+# distinct failed methods. Repeated demoing quietly stopped the address flag
+# firing. A demo that gets weaker the more you run it is the wrong trade.
+#
+# Fresh identities per run cost the cross-run ring story and buy a scenario that
+# behaves identically every time.
+#
+# The prefixes are kept recognisable on purpose. `ip_hash` is normally an HMAC hex
+# digest derived server-side from the connection, so a `demo_ip_` prefix is not a
+# value `ip_hash_of()` can ever produce -- a synthetic address cannot be confused
+# with, or collide with, a real one.
+DEMO_DEVICE_PREFIX = "demo_device_"
+DEMO_IP_PREFIX = "demo_ip_"
+DEMO_HOME_DEVICE_PREFIX = "demo_home_device_"
+DEMO_HOME_IP_PREFIX = "demo_home_ip_"
 DEMO_EMAIL_DOMAIN = "example.test"
 
 # Depth of the replayed history. Sized so the account is a plausible established
@@ -5923,15 +6236,30 @@ def _demo_guard() -> dict:
     return st
 
 
-def demo_customer_id() -> str:
-    """A fresh synthetic account per run.
+def demo_identity() -> dict:
+    """Every identifier one run needs, minted fresh and sharing one token.
 
-    Deliberately not a fixed id. A stable one would carry the previous run's
-    velocity deque and running mean into the next, so the second demo of the
-    afternoon would score differently from the first for reasons nobody watching
-    could see.
+    Nothing here is a fixed id. A stable customer would carry the previous run's
+    velocity deque and running mean into the next; a stable device or address would
+    carry its account count and failure rate, which are model features, so the
+    second demo of the afternoon would score differently from the first for reasons
+    nobody watching could see.
+
+    One token across all five values so an operator reading the console can tell at
+    a glance which run a transaction, device or address belongs to.
     """
-    return f"demo_cust_{uuid.uuid4().hex[:10]}"
+    token = uuid.uuid4().hex[:10]
+    return {
+        "run": token,
+        "customer_id": f"demo_cust_{token}",
+        "email": f"demo_fraudster+{token[-6:]}@{DEMO_EMAIL_DOMAIN}",
+        # The attack: an unfamiliar device on an unfamiliar address.
+        "device_fp": f"{DEMO_DEVICE_PREFIX}{token}",
+        "ip_hash": f"{DEMO_IP_PREFIX}{token}",
+        # The baseline: the customer's own device and address.
+        "home_device_fp": f"{DEMO_HOME_DEVICE_PREFIX}{token}",
+        "home_ip_hash": f"{DEMO_HOME_IP_PREFIX}{token}",
+    }
 
 
 def demo_schedule(now: float) -> list[float]:
@@ -5946,7 +6274,8 @@ def demo_schedule(now: float) -> list[float]:
             for i in range(DEMO_ATTEMPTS)]
 
 
-def demo_seed_history(store: InMemoryStore, cid: str, now: float) -> dict:
+def demo_seed_history(store: InMemoryStore, cid: str, now: float,
+                      home_device_fp: str = "", home_ip_hash: str = "") -> dict:
     """Replay an ordinary spending history for the demo account.
 
     `store.commit()` only -- the same mechanism `warm_store()` uses for historical
@@ -5954,18 +6283,45 @@ def demo_seed_history(store: InMemoryStore, cid: str, now: float) -> dict:
     they are not decisions FraudShield made; they are the baseline the attack
     deviates from. Returns a small summary for the response.
     """
+    # Derived from the customer id when not supplied, so a caller that only has a
+    # cid (a test, typically) still gets a self-consistent run.
+    token = cid.rsplit("_", 1)[-1]
+    home_device = home_device_fp or f"{DEMO_HOME_DEVICE_PREFIX}{token}"
+    home_ip = home_ip_hash or f"{DEMO_HOME_IP_PREFIX}{token}"
+
     created_at = now - DEMO_ACCOUNT_AGE_DAYS * 86400.0
     store.register_customer(cid, created_at)
 
     first = datetime.fromtimestamp(now, tz=timezone.utc) - timedelta(
         days=DEMO_BASELINE_SPAN_DAYS)
     step = DEMO_BASELINE_SPAN_DAYS / DEMO_BASELINE_TXNS
+
+    # The customer's shopping hours are anchored RELATIVE TO THE ATTACK, twelve
+    # hours away from it, rather than to a fixed clock time.
+    #
+    # WHY, and it is not cosmetic. `hour_deviation` measures the attack's distance
+    # from this customer's own habitual hour. With a fixed 18:00-21:00 baseline the
+    # signal depended on what time of day somebody happened to run the demo: at
+    # 08:00 every attempt scored BLOCK, and at 16:00 the same scenario dropped the
+    # UPI and wallet attempts to 69.5 and 47.5 -- under the block threshold -- so
+    # they settled successfully and the address never accumulated enough distinct
+    # failed methods to be flagged. A demo that behaves differently every hour is
+    # not a demo.
+    #
+    # Anchoring keeps the deviation constant instead of eliminating it, which is
+    # also how the training data builds account takeover: an off-hours transaction
+    # is off-hours relative to THIS customer, never against an absolute "3am is
+    # suspicious" rule.
+    attack_hour = datetime.fromtimestamp(now, tz=timezone.utc).hour
+    base_hour = (attack_hour + 12) % 24
+
     total = 0.0
     for i in range(DEMO_BASELINE_TXNS):
         dt = (first + timedelta(days=i * step)).replace(
-            # An evening shopper, so the hour profile is a real profile rather
-            # than noise spread evenly around the clock.
-            hour=18 + (i % 4), minute=(i * 7) % 60, second=0, microsecond=0)
+            # A habitual four-hour shopping window, so the hour profile is a real
+            # profile rather than noise spread evenly around the clock.
+            hour=(base_hour + (i % 4)) % 24,
+            minute=(i * 7) % 60, second=0, microsecond=0)
         amount = DEMO_BASELINE_AMOUNTS[i % len(DEMO_BASELINE_AMOUNTS)]
         total += amount
         store.commit({
@@ -5973,8 +6329,8 @@ def demo_seed_history(store: InMemoryStore, cid: str, now: float) -> dict:
             "ts": dt.timestamp(),
             "amount": amount,
             "payment_method": DEMO_BASELINE_METHODS[i % len(DEMO_BASELINE_METHODS)],
-            "device_fp": DEMO_HOME_DEVICE_FP,
-            "ip_hash": DEMO_HOME_IP_HASH,
+            "device_fp": home_device,
+            "ip_hash": home_ip,
             "status": "success",
             "hour": dt.hour + dt.minute / 60.0,
         })
@@ -5983,7 +6339,8 @@ def demo_seed_history(store: InMemoryStore, cid: str, now: float) -> dict:
         "span_days": DEMO_BASELINE_SPAN_DAYS,
         "account_age_days": DEMO_ACCOUNT_AGE_DAYS,
         "average_amount": round(total / DEMO_BASELINE_TXNS, 2),
-        "device_fp": DEMO_HOME_DEVICE_FP,
+        "device_fp": home_device,
+        "ip_hash": home_ip,
         "persisted": False,
         "scored": False,
         "note": ("in-process context only, replayed exactly like the historical "
@@ -6012,11 +6369,18 @@ def demo_fraud_attack(actor: User = Depends(require_role("admin"))) -> dict:
 
     WHAT REPEATED RUNS DO
     ---------------------
-    Each run uses a new customer id but the SAME device and address, so the
-    device's account count genuinely grows: run five and `device_abuse` starts
-    firing on its own, run seven and so does `ip_concentration`. That is emergent,
-    not staged -- the accounts really do share the device -- so the score moves
-    between runs and the response reports the counts the engine actually saw.
+    Nothing to each other. Every run mints its own customer, device and address, so
+    two runs are fully isolated and the scenario behaves identically the tenth time
+    as the first.
+
+    It used to share one fixed device and address, which made the ring genuinely
+    grow across runs -- and quietly broke the demo. Those identifiers feed
+    `device_account_count`, `ip_account_count` and `device_failure_rate`, all model
+    features, so by the third run the account looked established, some attempts fell
+    under the block threshold, MANUAL_REVIEW attempts reached the simulator and
+    mostly succeeded, and the address then never accumulated three distinct failed
+    methods. The suspicious-address alert stopped firing the more the demo was used.
+    Reproducibility won.
     """
     _demo_guard()
 
@@ -6025,11 +6389,16 @@ def demo_fraud_attack(actor: User = Depends(require_role("admin"))) -> dict:
     records = STATE["records"]
     provider = STATE["payment_provider"]
 
-    cid = demo_customer_id()
-    email = f"demo_fraudster+{cid[-6:]}@{DEMO_EMAIL_DOMAIN}"
+    ident = demo_identity()
+    cid = ident["customer_id"]
+    email = ident["email"]
+    device_fp = ident["device_fp"]
+    ip_hash = ident["ip_hash"]
     now = datetime.now(timezone.utc).timestamp()
 
-    baseline = demo_seed_history(store, cid, now)
+    baseline = demo_seed_history(store, cid, now,
+                                home_device_fp=ident["home_device_fp"],
+                                home_ip_hash=ident["home_ip_hash"])
 
     results: list[dict] = []
     signals: set[str] = set()
@@ -6047,8 +6416,8 @@ def demo_fraud_attack(actor: User = Depends(require_role("admin"))) -> dict:
             "ts": ts,
             "amount": amount,
             "payment_method": method,
-            "device_fp": DEMO_DEVICE_FP,
-            "ip_hash": DEMO_IP_HASH,
+            "device_fp": device_fp,
+            "ip_hash": ip_hash,
         }
 
         # THE REAL ENGINE. Nothing below reinterprets what it returns.
@@ -6063,7 +6432,7 @@ def demo_fraud_attack(actor: User = Depends(require_role("admin"))) -> dict:
         auth = provider.authorise(
             order_id=order_id, amount=amount, method=method,
             decision=d.decision, customer_id=cid,
-            metadata={"device_fp": DEMO_DEVICE_FP, "ip_hash": DEMO_IP_HASH},
+            metadata={"device_fp": device_fp, "ip_hash": ip_hash},
         )
         settled = auth.settlement
 
@@ -6088,24 +6457,24 @@ def demo_fraud_attack(actor: User = Depends(require_role("admin"))) -> dict:
                 "transaction_id": txn_id, "customer_id": cid, "email": email,
                 "amount": amount, "payment_method": method,
                 "instrument_display": f"demo {method}",
-                "device_fp": DEMO_DEVICE_FP, "ip_hash": DEMO_IP_HASH,
+                "device_fp": device_fp, "ip_hash": ip_hash,
                 "risk_score": d.risk_score, "decision": d.decision,
                 "customer_status": status_key, "created_at": dt.isoformat(),
                 "demo": True, "demo_scenario": DEMO_SCENARIO,
             }
             try:
-                records.put(f"IPFAIL#{DEMO_IP_HASH}",
+                records.put(f"IPFAIL#{ip_hash}",
                             f"ATTEMPT#{dt.isoformat()}#{attempt_id}", attempt)
             except Exception as exc:  # noqa: BLE001
                 print(f"WARNING: demo failed-attempt write did not land "
                       f"({type(exc).__name__})")
-            STATE["fail_ips"].add(DEMO_IP_HASH)
-            flag = store.evaluate_ip_suspicion(DEMO_IP_HASH, ts)
+            STATE["fail_ips"].add(ip_hash)
+            flag = store.evaluate_ip_suspicion(ip_hash, ts)
             if flag is not None:
                 ip_flag = flag
                 try:
-                    records.put("SUSPICIOUS#IP", DEMO_IP_HASH, {
-                        "ip_hash": DEMO_IP_HASH, "since": flag["since"],
+                    records.put("SUSPICIOUS#IP", ip_hash, {
+                        "ip_hash": ip_hash, "since": flag["since"],
                         "reason": flag["reason"], "last_seen": dt.isoformat(),
                         "failures_total": flag["failures_total"],
                         "accounts": flag["accounts"],
@@ -6116,11 +6485,14 @@ def demo_fraud_attack(actor: User = Depends(require_role("admin"))) -> dict:
                           f"({type(exc).__name__})")
                 if flag["new"]:
                     audit(actor="system", action="ip_marked_suspicious",
-                          before={"ip_hash": DEMO_IP_HASH},
+                          before={"ip_hash": ip_hash},
                           after={**flag, "demo": True,
                                  "demo_scenario": DEMO_SCENARIO})
                     audit_events += 1
-                    notify_suspicious_ip(flag)
+                    # Marked copy, so the alert this raises is audited as
+                    # synthetic too. The stored flag itself is untouched.
+                    notify_suspicious_ip({**flag, "demo": True,
+                                          "demo_scenario": DEMO_SCENARIO})
 
         record = {
             "order_id": order_id, "transaction_id": txn_id, "customer_id": cid,
@@ -6129,7 +6501,7 @@ def demo_fraud_attack(actor: User = Depends(require_role("admin"))) -> dict:
             "product_name": f"Demo attempt {i} of {DEMO_ATTEMPTS}",
             "amount": amount, "payment_method": method,
             "instrument_display": f"demo {method}",
-            "device_fp": DEMO_DEVICE_FP, "ip_hash": DEMO_IP_HASH,
+            "device_fp": device_fp, "ip_hash": ip_hash,
             "ip_suspicious": ip_flag is not None,
             "settlement": settled, "created_at": dt.isoformat(),
             "customer_status": status_key,
@@ -6197,8 +6569,8 @@ def demo_fraud_attack(actor: User = Depends(require_role("admin"))) -> dict:
         "attempts_generated": len(results),
         "customer_id": cid,
         "customer_email": email,
-        "device_id": DEMO_DEVICE_FP,
-        "ip_hash": DEMO_IP_HASH,
+        "device_id": device_fp,
+        "ip_hash": ip_hash,
         "window_seconds": (DEMO_ATTEMPTS - 1) * DEMO_SPACING_SECONDS,
         "first_attempt_at": results[0]["at"],
         "last_attempt_at": final["at"],
@@ -6261,8 +6633,8 @@ def demo_fraud_attack(actor: User = Depends(require_role("admin"))) -> dict:
             "scenario": DEMO_SCENARIO,
             "attempts_requested": DEMO_ATTEMPTS,
             "customer_id": cid,
-            "device_fp": DEMO_DEVICE_FP,
-            "ip_hash": DEMO_IP_HASH,
+            "device_fp": device_fp,
+            "ip_hash": ip_hash,
             "window_seconds": summary["window_seconds"],
         },
         after={

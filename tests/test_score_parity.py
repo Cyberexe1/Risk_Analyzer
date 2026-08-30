@@ -4,7 +4,7 @@ Offline/online SCORE parity.
 test_parity.py proves the 22 features agree. That is necessary but not sufficient:
 the final risk score also depends on the rule layer and the entity-graph network
 layer, and those are implemented twice -- batch in ml/scoring.py, incremental in
-backend.py. If they disagree, the metrics in docs/EVALUATION.md were produced by a
+backend.py. If they disagree, the metrics in ml/artifacts/metrics.json were produced by a
 scorer that is not the one serving traffic.
 
 This replays the dataset through the online path and compares the ML score, rule

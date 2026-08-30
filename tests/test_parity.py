@@ -1,7 +1,7 @@
 """
 Offline/online feature parity.
 
-The central claim behind docs/EVALUATION.md is that features were built the way a
+The central claim behind ml/artifacts/metrics.json is that features were built the way a
 production scorer would build them. Until now that was an assertion. This test
 replays the generated dataset one transaction at a time through the store and
 online feature builder in backend.py -- which have no access to a sorted file,

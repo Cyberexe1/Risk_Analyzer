@@ -88,8 +88,38 @@ function CartButton() {
 }
 
 function Nav() {
-  const { user } = useAuth()
+  const { user, logout } = useAuth()
   const isStaff = user?.role === 'analyst' || user?.role === 'admin'
+
+  // STAFF HEADER: the brand and Log out, nothing else.
+  //
+  // An analyst reviewing a blocked payment has no use for Checkout, Orders,
+  // Offers or a shopping cart, and the role badge only repeats what the page
+  // they are already on says in its title. Every one of those was a thing to
+  // read past on the way to the work.
+  //
+  // The brand points at the console rather than the marketing page, because with
+  // the nav gone it is the only link left and sending it to a landing page would
+  // strand a staff user with no route back.
+  if (isStaff) {
+    return (
+      <header className="nav">
+        <div className="wrap nav-inner">
+          <NavLink to="/admin" className="brand">
+            <span className="brand-mark" aria-hidden="true">
+              {'\u25C6'}
+            </span>
+            FraudShield
+          </NavLink>
+          <nav className="nav-links" aria-label="Main">
+            <button className="btn btn-ghost btn-sm" onClick={() => void logout()}>
+              Log out
+            </button>
+          </nav>
+        </div>
+      </header>
+    )
+  }
 
   return (
     <header className="nav">
@@ -120,13 +150,9 @@ function Nav() {
               </NavLink>
             </>
           )}
-          {/* Hidden for customers as a courtesy only. The backend enforces the
-              role on every admin request — a nav link is not a control. */}
-          {isStaff && (
-            <NavLink to="/admin" className="nav-link">
-              Console
-            </NavLink>
-          )}
+          {/* No Console link here: staff never reach this branch, they get the
+              minimal header above. The backend enforces the role on every admin
+              request regardless — a nav link was never the control. */}
           <CartButton />
           <span
             aria-hidden="true"

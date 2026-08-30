@@ -238,8 +238,9 @@ describe('result summary', () => {
 
   it('reports the score and decision the server returned', async () => {
     await run()
-    expect(screen.getByText('77')).toBeInTheDocument()
-    expect(screen.getAllByText('BLOCK').length).toBeGreaterThan(0)
+    // 77 appears in the headline and again on the eighth row.
+    expect(screen.getAllByText('77').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Block').length).toBeGreaterThan(0)
   })
 
   it('reports the signals that actually fired, not a fixed list', async () => {
@@ -257,7 +258,9 @@ describe('result summary', () => {
     const rows = screen.getAllByRole('row')
     // Eight attempts plus the header row.
     expect(rows).toHaveLength(9)
-    expect(screen.getByText('74')).toBeInTheDocument()
+    expect(screen.getAllByText('74').length).toBeGreaterThan(0)
+    // Every row carries its own decision badge, not one summary badge.
+    expect(screen.getAllByText('Block').length).toBeGreaterThanOrEqual(8)
   })
 
   it('reports the email outcome in the notification system\u2019s own terms', async () => {
@@ -293,8 +296,8 @@ describe('result summary', () => {
       notification_triggered: false,
       notifications: {},
     })
-    expect(screen.getAllByText('ALLOW').length).toBeGreaterThan(0)
-    expect(screen.queryByText('BLOCK')).not.toBeInTheDocument()
+    expect(screen.getAllByText('Allow').length).toBeGreaterThan(0)
+    expect(screen.queryByText('Block')).not.toBeInTheDocument()
     expect(screen.getByText(/0 of 8 queued/i)).toBeInTheDocument()
     expect(screen.getByText(/nothing alertable/i)).toBeInTheDocument()
   })

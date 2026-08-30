@@ -5,8 +5,7 @@ Create the FraudShield DynamoDB table. Idempotent.
     python scripts/create_table.py --check    # report only, no writes
 
 Single table, PK + SK, PAY_PER_REQUEST. Holds users, refresh tokens, orders,
-returns and the review queue -- see docs/ARCHITECTURE.md section 3 for the item
-shapes.
+returns and the review queue -- see README section 17 for the item shapes.
 
 WHAT THIS COSTS: on-demand billing means you pay per request, not per hour. At
 demo volume that is fractions of a rupee. It is still a persistent resource in

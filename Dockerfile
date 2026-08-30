@@ -10,9 +10,15 @@ FROM python:3.13-slim
 
 WORKDIR /srv
 
-# Runtime deps only -- no scikit-learn (see requirements-serve.txt).
-COPY requirements-serve.txt .
-RUN pip install --no-cache-dir -r requirements-serve.txt
+# Dependencies. NOTE: requirements.txt is now a single consolidated file, so this
+# installs the training and test packages (scikit-learn, pytest, httpx) as well as
+# the runtime ones. Nothing in the request path imports them -- the calibrator is
+# read from JSON and interpolated with numpy -- so they are dead weight in the
+# image rather than a behaviour change. That is a deliberate trade of image size
+# against having one requirements file; restoring the serve/dev split is what
+# would shrink it again.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # The trained model, the isotonic calibrator knots, and the feature spec.
 COPY ml/artifacts/model.json ml/artifacts/calibrator.json \
@@ -54,7 +60,7 @@ EXPOSE 8000
 # PAYMENTS: this image runs the SIMULATED gateway by default. To use Razorpay Test
 # Mode set FRAUDSHIELD_PAYMENT_PROVIDER=razorpay plus RAZORPAY_KEY_ID and
 # RAZORPAY_KEY_SECRET, and install the SDK (`pip install razorpay`, which is NOT
-# in requirements-serve.txt). Without all three the service logs a DEGRADED
+# in requirements.txt). Without all three the service logs a DEGRADED
 # warning and keeps serving the simulator rather than failing every checkout.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"

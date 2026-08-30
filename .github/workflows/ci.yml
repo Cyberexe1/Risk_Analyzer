@@ -76,14 +76,14 @@ jobs:
           python-version: '3.13'
           cache: pip
           cache-dependency-path: |
-            requirements-serve.txt
-            requirements-dev.txt
+            requirements.txt
 
       - name: Install dependencies
+        # pytest and httpx are declared in requirements.txt now, so the explicit
+        # `pip install pytest` workaround this job used to carry is gone.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-serve.txt -r requirements-dev.txt
-          pip install pytest
+          pip install -r requirements.txt
 
       - name: Confirm no payment-provider credentials are present
         # A guard, not a formality. If a credential ever leaks into the

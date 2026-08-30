@@ -327,19 +327,37 @@ def test_ip_state_survives_restart(db):
 
 
 def test_ip_failure_state_survives_restart(db):
-    """The suspicious-IP threshold counts failures in a trailing hour."""
+    """Both suspicious-IP counters are rebuilt by the replay, not just the count.
+
+    Three declines on three DIFFERENT methods, so this exercises the breadth rule
+    (>= 3 distinct methods inside 2 hours) rather than the volume rule. That is the
+    stricter test of the replay: the count alone would survive a replay that
+    discarded `payment_method`, and the flag would then silently stop firing after
+    every restart.
+    """
     ip = "ip_burst_d"
+    methods = ("card", "upi", "netbanking")
     with app_run() as c:
-        for i in range(3):
-            score(c, customer=f"c_burst_{i}", ts=T0 - (30 - i) * MIN,
-                  device=f"dev_burst_{i}", ip=ip, status="failed")
-        before = backend.STATE["store"].ip_failures_recent(ip, T0)
+        # Inside the 20-minute volume window as well as the 2-hour breadth window,
+        # so both counters are non-zero and the replay of both is observable.
+        for i, m in enumerate(methods):
+            score(c, customer=f"c_burst_{i}", ts=T0 - (10 - i) * MIN,
+                  device=f"dev_burst_{i}", ip=ip, method=m, status="failed")
+        store = backend.STATE["store"]
+        before = store.ip_failures_recent(ip, T0)
+        before_methods = store.ip_failed_methods_recent(ip, T0)
+        assert store.evaluate_ip_suspicion(ip, T0)["rule"] == "breadth"
 
     with app_run() as c:
-        after = backend.STATE["store"].ip_failures_recent(ip, T0)
-        assert backend.STATE["store"].evaluate_ip_suspicion(ip, T0) is not None
+        store = backend.STATE["store"]
+        after = store.ip_failures_recent(ip, T0)
+        after_methods = store.ip_failed_methods_recent(ip, T0)
+        flag = store.evaluate_ip_suspicion(ip, T0)
+        assert flag is not None, "the breadth rule stopped firing after a restart"
+        assert flag["rule"] == "breadth"
 
     assert before == after == 3
+    assert before_methods == after_methods == set(methods)
 
 
 # ===========================================================================

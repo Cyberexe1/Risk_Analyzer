@@ -9,7 +9,7 @@ venv/
 ml/data/*.csv
 
 # Trained artifacts are kept in git on purpose: metrics.json is the source of
-# truth the docs are checked against, and model.json is small.
+# truth the README is checked against, and model.json is small.
 !ml/artifacts/
 
 .env
@@ -22,6 +22,7 @@ _demo_out.txt
 build/
 *.egg-info/
 *.log
+.pytest_cache/
 
 # frontend
 web/node_modules/

@@ -15,8 +15,10 @@ import { ErrorNote, Stat } from '../components'
  */
 export default function SuspiciousIps() {
   const [items, setItems] = useState<SuspiciousIp[]>([])
-  const [threshold, setThreshold] = useState(3)
-  const [windowMin, setWindowMin] = useState(60)
+  const [threshold, setThreshold] = useState(10)
+  const [windowMin, setWindowMin] = useState(20)
+  const [methodThreshold, setMethodThreshold] = useState(3)
+  const [methodWindowHours, setMethodWindowHours] = useState(2)
   const [totalAttempts, setTotalAttempts] = useState<number | null>(null)
   const [open, setOpen] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -31,6 +33,10 @@ export default function SuspiciousIps() {
       setItems(s.items)
       setThreshold(s.threshold)
       setWindowMin(s.window_minutes)
+      // Optional so an older backend that publishes only the volume pair still
+      // renders, rather than showing "undefined methods".
+      if (s.method_threshold) setMethodThreshold(s.method_threshold)
+      if (s.method_window_hours) setMethodWindowHours(s.method_window_hours)
       setTotalAttempts(f?.count ?? null)
       setError(null)
     } catch (e) {
@@ -51,16 +57,27 @@ export default function SuspiciousIps() {
       {error && <ErrorNote error={error} />}
 
       <div className="grid grid-4">
-        <Stat k="Flagged addresses" v={items.length} n="currently marked" />
+        {/* The stored-decline total rides along here rather than taking its own
+            tile: the grid is four wide, and the two rules each earned a tile now
+            that a single threshold pair can no longer describe the trigger. */}
         <Stat
-          k="Trigger"
-          v={`${threshold} fails`}
+          k="Flagged addresses"
+          v={items.length}
+          n={
+            totalAttempts === null
+              ? 'currently marked'
+              : `currently marked \u00b7 ${totalAttempts} declines stored`
+          }
+        />
+        <Stat
+          k="Volume rule"
+          v={`>${threshold - 1} fails`}
           n={`within ${windowMin} minutes`}
         />
         <Stat
-          k="Failed attempts"
-          v={totalAttempts ?? '\u2014'}
-          n="stored across all addresses"
+          k="Breadth rule"
+          v={`${methodThreshold}+ methods`}
+          n={`failing within ${methodWindowHours} hours`}
         />
         <Stat
           k="Scoring impact"
@@ -70,12 +87,16 @@ export default function SuspiciousIps() {
       </div>
 
       <div className="note">
-        A single decline is not evidence: cards expire and balances run out. A{' '}
-        <strong>burst</strong> from one address is different &mdash; that is the shape
-        card testing leaves, where an attacker walks a list of stolen numbers until one
-        authorises. Addresses carrying more than 25 accounts are exempt, because a
-        carrier NAT or an office range pools unrelated customers&rsquo; declines through
-        no fault of anyone behind it.
+        A single decline is not evidence: cards expire and balances run out. Two rules
+        catch the two shapes the same attack takes, and <strong>either</strong> is
+        enough. <strong>Volume</strong> &mdash; more than {threshold - 1} declines in{' '}
+        {windowMin} minutes &mdash; is a machine working a list. <strong>Breadth</strong>{' '}
+        &mdash; {methodThreshold} or more different payment methods failing within{' '}
+        {methodWindowHours} hours &mdash; is the patient version, spread out enough to
+        stay under the volume rule, which a burst detector cannot see at all.
+        Addresses carrying more than 25 accounts are exempt, because a carrier NAT or
+        an office range pools unrelated customers&rsquo; declines through no fault of
+        anyone behind it.
       </div>
 
       {loading && <div className="empty">Loading&hellip;</div>}
@@ -83,9 +104,11 @@ export default function SuspiciousIps() {
       {!loading && !items.length && (
         <div className="card empty">
           <p style={{ marginBottom: 0 }}>
-            No addresses flagged. Fail {threshold} payments within {windowMin} minutes
-            from the same network to populate this &mdash; the checkout&rsquo;s
-            &ldquo;Fails checksum&rdquo; test card is the quickest way.
+            No addresses flagged. Either fail {threshold} payments within{' '}
+            {windowMin} minutes from the same network, or fail {methodThreshold}{' '}
+            different payment methods within {methodWindowHours} hours &mdash; the
+            checkout&rsquo;s &ldquo;Fails checksum&rdquo; test card is the quickest
+            way to produce declines.
           </p>
         </div>
       )}
@@ -132,7 +155,27 @@ export default function SuspiciousIps() {
                       <td className="muted t-2xs">
                         {it.since ? new Date(it.since).toLocaleString() : '\u2014'}
                       </td>
-                      <td className="t-sm">{it.reason}</td>
+                      <td className="t-sm">
+                        {/* Which rule fired, then the reason it recorded at the
+                            time. A flag an analyst cannot attribute to a rule is
+                            not actionable. Older records carry no rule, so the
+                            chip is omitted rather than guessed. */}
+                        {it.rule && (
+                          <span
+                            className="badge badge-neutral"
+                            style={{ marginRight: 'var(--sp-2)' }}
+                          >
+                            {it.rule}
+                          </span>
+                        )}
+                        {it.reason}
+                        {!!it.failed_method_count && it.failed_method_count > 1 && (
+                          <div className="muted t-2xs" style={{ marginTop: 'var(--sp-1)' }}>
+                            {it.failed_method_count} methods:{' '}
+                            {(it.failed_methods ?? []).join(', ')}
+                          </div>
+                        )}
+                      </td>
                       <td className="num">{it.failures_total}</td>
                       <td className="num">{it.accounts}</td>
                       <td>

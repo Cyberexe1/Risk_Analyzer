@@ -113,7 +113,8 @@ MAX_COMPONENT = 200
 def network_scores(df: pd.DataFrame) -> np.ndarray:
     """Shared-entity graph score, built incrementally in time order.
 
-    Approximations vs. docs/RISK_ENGINE.md, stated plainly:
+    Approximations vs. the full graph expansion described in README section 14,
+    stated plainly:
       - depth-2 expansion only runs when the depth-1 component is small (<20
         accounts), to keep this O(n) on 100k rows
       - the `sync` term uses the share of component accounts active in the last

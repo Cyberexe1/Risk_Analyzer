@@ -26,10 +26,13 @@ Run:  python -m pytest tests/test_demo_attack.py -v
 from __future__ import annotations
 
 import os
+import re
 import smtplib
 import sys
 import uuid
+import json
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -366,8 +369,8 @@ def test_every_attempt_is_the_same_device(db):
         body = trigger(c, admin(c))
         devices = {backend.STATE["txns"][r["transaction_id"]]["device_fp"]
                    for r in body["results"]}
-    assert devices == {backend.DEMO_DEVICE_FP}
-    assert body["device_id"] == backend.DEMO_DEVICE_FP
+    assert devices == {body["device_id"]}
+    assert body["device_id"].startswith(backend.DEMO_DEVICE_PREFIX)
 
 
 def test_every_attempt_is_the_same_address(db):
@@ -375,14 +378,17 @@ def test_every_attempt_is_the_same_address(db):
         body = trigger(c, admin(c))
         ips = {backend.STATE["txns"][r["transaction_id"]]["ip_hash"]
                for r in body["results"]}
-    assert ips == {backend.DEMO_IP_HASH}
+    assert ips == {body["ip_hash"]}
+    assert body["ip_hash"].startswith(backend.DEMO_IP_PREFIX)
 
 
 def test_the_synthetic_address_cannot_collide_with_a_derived_one(db):
     """`ip_hash_of()` produces a hex digest. A `demo_ip_` prefix is not something
     it can ever return, so synthetic and real addresses cannot be confused."""
-    assert backend.DEMO_IP_HASH.startswith("demo_ip_")
-    assert not all(ch in "0123456789abcdef" for ch in backend.DEMO_IP_HASH)
+    ident = backend.demo_identity()
+    assert ident["ip_hash"].startswith("demo_ip_")
+    assert not all(ch in "0123456789abcdef" for ch in ident["ip_hash"])
+    assert ident["home_ip_hash"].startswith("demo_home_ip_")
 
 
 def test_all_timestamps_sit_inside_the_ten_minute_window(db):
@@ -474,8 +480,8 @@ def test_every_scorer_call_receives_the_same_actor(db, monkeypatch):
         trigger(c, admin(c))
 
     assert len({t["customer_id"] for t in calls}) == 1
-    assert {t["device_fp"] for t in calls} == {backend.DEMO_DEVICE_FP}
-    assert {t["ip_hash"] for t in calls} == {backend.DEMO_IP_HASH}
+    assert len({t["device_fp"] for t in calls}) == 1
+    assert len({t["ip_hash"] for t in calls}) == 1
     assert [t["ts"] for t in calls] == sorted(t["ts"] for t in calls)
 
 
@@ -628,18 +634,61 @@ def test_the_network_layer_sees_a_single_account_on_the_first_run(db):
     assert {r["sub_scores"]["network"] for r in body["results"]} == {0.0}
 
 
-def test_repeated_runs_genuinely_accumulate_on_the_device(db):
-    """Emergent, not staged: each run is a new account on the same device, so the
-    device's account count really does grow."""
+def test_repeated_runs_are_fully_isolated(db):
+    """Every run mints its own customer, device and address.
+
+    THE BUG THIS REPLACES A TEST FOR. The device and address used to be fixed
+    constants, so each run added an account to the same device and the ring grew --
+    which read as a feature until it broke the demo. Those counts are model
+    features, so by the third run the account looked established, some attempts fell
+    under the block threshold, MANUAL_REVIEW attempts reached the simulator and
+    mostly succeeded, and the address stopped accumulating three distinct failed
+    methods. The suspicious-address alert quietly stopped firing the more the demo
+    was used.
+
+    Isolation is what makes the scenario reproducible, so it is what gets asserted.
+    """
     with app_run() as c:
         h = admin(c)
-        first = trigger(c, h)
-        second = trigger(c, h)
-        third = trigger(c, h)
+        runs = [trigger(c, h) for _ in range(3)]
 
-    assert first["evidence"]["device_account_count"] == 1
-    assert second["evidence"]["device_account_count"] == 2
-    assert third["evidence"]["device_account_count"] == 3
+    for r in runs:
+        # Never inherits another run's history, however many times it is clicked.
+        assert r["evidence"]["device_account_count"] == 1
+        assert r["evidence"]["ip_account_count"] == 1
+        assert r["evidence"]["prev_txn_count"] == (
+            backend.DEMO_BASELINE_TXNS + backend.DEMO_ATTEMPTS - 1)
+
+    for field in ("customer_id", "device_id", "ip_hash"):
+        values = {r[field] for r in runs}
+        assert len(values) == 3, f"{field} was reused across runs: {values}"
+
+    # And the run token ties one run's identifiers together, so an operator can see
+    # at a glance which run a device or address belongs to.
+    for r in runs:
+        token = r["customer_id"].rsplit("_", 1)[-1]
+        assert r["device_id"].endswith(token)
+        assert r["ip_hash"].endswith(token)
+
+
+def test_the_scenario_is_reproducible_across_runs(db):
+    """The point of isolation: the same decisions and signals every time.
+
+    This is what the fixed device and address cost. Not asserting exact scores --
+    those belong to the engine -- but that the OUTCOME does not drift with use.
+    """
+    with app_run() as c:
+        h = admin(c)
+        runs = [trigger(c, h) for _ in range(3)]
+
+    assert len({tuple(sorted(r["signals"])) for r in runs}) == 1, \
+        f"signals drifted across runs: {[sorted(r['signals']) for r in runs]}"
+    assert len({json.dumps(r["decisions"], sort_keys=True) for r in runs}) == 1, \
+        f"decisions drifted across runs: {[r['decisions'] for r in runs]}"
+    assert len({r["ip_flagged"] for r in runs}) == 1, \
+        "the address flag fired on some runs and not others"
+    assert len({r["final_transaction"]["risk_score"] for r in runs}) == 1, \
+        "the final score drifted across runs"
 
 
 # ===========================================================================
@@ -665,7 +714,7 @@ def test_the_rehydration_pointer_is_written_for_every_attempt(db):
     assert ids == {r["transaction_id"] for r in body["results"]}
     for p in pointers:
         assert p["customer_id"] == body["customer_id"]
-        assert p["device_fp"] == backend.DEMO_DEVICE_FP
+        assert p["device_fp"] == body["device_id"]
         assert p["committed"] is True
 
 
@@ -723,6 +772,8 @@ def test_velocity_counters_are_rebuilt_from_the_generated_attempts(db):
     with app_run() as c:
         body = trigger(c, admin(c))
         cid = body["customer_id"]
+        device = body["device_id"]
+        ip = body["ip_hash"]
         last_ts = backend._iso_to_epoch(body["results"][-1]["at"])
 
     with app_run() as c:
@@ -730,9 +781,9 @@ def test_velocity_counters_are_rebuilt_from_the_generated_attempts(db):
         v10, v1h, _f10, _f1h = store.velocity(cid, last_ts)
         assert v10 == 8, "the eight attempts did not come back into the window"
         assert v1h == 8
-        assert backend.DEMO_DEVICE_FP in store.acct_devices[cid]
-        assert cid in store.device_accounts(backend.DEMO_DEVICE_FP)
-        assert cid in store.ip_accounts(backend.DEMO_IP_HASH)
+        assert device in store.acct_devices[cid]
+        assert cid in store.device_accounts(device)
+        assert cid in store.ip_accounts(ip)
 
 
 def test_a_persistence_failure_is_reported_not_hidden(db, monkeypatch):
@@ -795,6 +846,68 @@ def test_the_demo_marker_is_on_every_generated_audit_event(db):
         after = e.get("after") or {}
         assert after.get("demo") is True, e["action"]
         assert after.get("demo_scenario") == "fraud_attack"
+
+
+def test_notification_audit_events_are_marked_too(db, monkeypatch):
+    """The gap this closes: with recipients configured the run also emits
+    NOTIFICATION_SENT events, and an auditor filtering for synthetic activity must
+    not have to reason about which communications belonged to it."""
+    fake, _ = pinned(score=91.4, decision="BLOCK")
+    monkeypatch.setattr(backend.Scorer, "score", fake)
+    with app_run() as c:
+        h = admin(c)
+        backend.STATE["email_recipients"] = ("analyst@example.com",)
+        trigger(c, h)
+        entries = audit_entries(c, h)
+
+    # Five transaction alerts are delivered (the volume ceiling), three are
+    # throttled, and the suspicious-address alert is exempt from the ceiling and
+    # delivered as well. Every one of those, delivered or withheld, must carry the
+    # marker -- a withheld alert is still evidence of synthetic activity.
+    notes = [e for e in entries
+             if e["action"] in (backend.NOTIFICATION_SENT,
+                                backend.NOTIFICATION_THROTTLED)]
+    sent = [e for e in notes if e["action"] == backend.NOTIFICATION_SENT]
+    throttled = [e for e in notes if e["action"] == backend.NOTIFICATION_THROTTLED]
+
+    assert len(sent) == backend.ALERT_RATE_MAX + 1, "5 blocks + 1 address alert"
+    assert len(throttled) == backend.DEMO_ATTEMPTS - backend.ALERT_RATE_MAX
+    assert {e["before"]["event_type"] for e in sent} == {"BLOCK",
+                                                         nf.EVENT_SUSPICIOUS_IP}
+    assert {e["before"]["event_type"] for e in throttled} == {"BLOCK"}
+    for e in notes:
+        assert e["after"]["demo"] is True
+        assert e["after"]["demo_scenario"] == "fraud_attack"
+        # Marked in `after`, next to is_ground_truth, exactly where RISK_DECISION
+        # carries it -- and not duplicated into `before`.
+        assert "demo" not in e["before"]
+        assert e["after"]["is_ground_truth"] is False
+    # And still no leak: a count, never an address.
+    assert "analyst@example.com" not in repr(entries)
+
+
+def test_a_real_alert_carries_no_demo_marker(db):
+    """`related` drops None, so real traffic passes no marker at all."""
+    with app_run() as c:
+        h = admin(c)
+        backend.STATE["email_recipients"] = ("analyst@example.com",)
+        cust = register(c, f"alert-{uuid.uuid4().hex[:8]}@example.com")
+        # Ten items on one order is a large amount for a brand-new account, which
+        # is enough to leave ALLOW without touching a threshold.
+        c.post("/v1/orders", headers=cust, json={
+            "items": [{"product_id": "p2", "qty": 5}],
+            "payment_method": "upi",
+            "upi": {"vpa": "buyer@okaxis"},
+            "device_fp": "dev_alert_001",
+        })
+        entries = audit_entries(c, h)
+
+    notes = [e for e in entries
+             if e["action"] in (backend.NOTIFICATION_SENT,
+                                backend.NOTIFICATION_FAILED)]
+    for e in notes:
+        assert "demo" not in e["after"], e
+        assert "demo_scenario" not in e["after"], e
 
 
 def test_a_real_transaction_carries_no_demo_marker(db):
@@ -938,8 +1051,13 @@ def test_an_alert_is_recorded_for_each_queued_attempt(db, monkeypatch):
         log = c.get("/v1/admin/notifications?limit=200", headers=h).json()
 
     assert body["notification_triggered"] is True
-    assert body["notifications"].get("sent") == 8
-    assert log["count"] >= 8
+    # The volume ceiling caps delivery at ALERT_RATE_MAX; the rest are recorded as
+    # throttled rather than dropped, so all eight attempts are still accounted for.
+    assert body["notifications"].get("sent") == backend.ALERT_RATE_MAX
+    assert body["notifications"].get(nf.STATUS_THROTTLED) == (
+        backend.DEMO_ATTEMPTS - backend.ALERT_RATE_MAX)
+    assert sum(body["notifications"].values()) == backend.DEMO_ATTEMPTS
+    assert log["count"] >= backend.DEMO_ATTEMPTS
 
 
 def test_the_demo_reaches_the_smtp_provider_when_one_is_configured(db, monkeypatch):
@@ -957,13 +1075,17 @@ def test_the_demo_reaches_the_smtp_provider_when_one_is_configured(db, monkeypat
         backend.STATE["email_recipients"] = ("analyst@example.com",)
         body = trigger(c, admin(c))
 
-    assert body["notifications"].get("sent") == 8
-    # Eight transaction alerts. There may be a ninth message: every BLOCK settles
-    # failed, so the existing IP-suspicion path fires its own separate alert. That
-    # is the architecture working, not the demo double-sending.
+    assert body["notifications"].get("sent") == backend.ALERT_RATE_MAX
+    # Five transaction alerts reach the transport; the other three are throttled.
+    # There is also a separate suspicious-address message, because every BLOCK
+    # settles failed and that trips the breadth rule -- it is exempt from the
+    # ceiling, which is the architecture working rather than the demo double-sending.
     txn_alerts = [m for m in transport.messages
                   if "transaction blocked" in m[0]["Subject"]]
-    assert len(txn_alerts) == 8
+    assert len(txn_alerts) == backend.ALERT_RATE_MAX
+    ip_alerts = [m for m in transport.messages
+                 if "Suspicious IP detected" in m[0]["Subject"]]
+    assert len(ip_alerts) == 1, "the summary alert must survive the ceiling"
     msg, sender, recipients = txn_alerts[0]
     assert sender == "alerts@example.com"
     assert recipients == ("analyst@example.com",)
@@ -981,9 +1103,14 @@ def test_the_alert_body_carries_usable_evidence(db, monkeypatch):
         backend.STATE["email_recipients"] = ("analyst@example.com",)
         body = trigger(c, admin(c))
 
-    text = transport.messages[-1][0].get_content()
+    # The FIRST delivered transaction alert. Not the last message: the ceiling
+    # throttles the later attempts, and the suspicious-address alert arrives after
+    # them, so `messages[-1]` is no longer a transaction alert at all.
+    txn_alerts = [m for m in transport.messages
+                  if "transaction blocked" in m[0]["Subject"]]
+    text = txn_alerts[0][0].get_content()
     for needle in ("BLOCK", "91.4", "demo:fraud_attack",
-                   body["results"][-1]["transaction_id"]):
+                   body["results"][0]["transaction_id"]):
         assert needle in text, needle
 
 
@@ -1027,7 +1154,10 @@ def test_a_notification_failure_does_not_fail_the_run(db, monkeypatch):
     body = r.json()
     assert body["attempts_generated"] == 8
     assert body["transactions_persisted"] == 8
-    assert body["notifications"].get("failed") == 8
+    # Five attempted and failed at the transport; three never left the process.
+    assert body["notifications"].get("failed") == backend.ALERT_RATE_MAX
+    assert body["notifications"].get(nf.STATUS_THROTTLED) == (
+        backend.DEMO_ATTEMPTS - backend.ALERT_RATE_MAX)
 
 
 def test_a_notification_that_raises_does_not_fail_the_run(db, monkeypatch):
@@ -1068,7 +1198,7 @@ def test_the_address_is_flagged_when_the_declines_pile_up(db):
         ips = c.get("/v1/admin/suspicious-ips", headers=h).json()
 
     if body["ip_flagged"]:
-        assert backend.DEMO_IP_HASH in {i["ip_hash"] for i in ips["items"]}
+        assert body["ip_hash"] in {i["ip_hash"] for i in ips["items"]}
 
 
 # ===========================================================================
@@ -1265,7 +1395,252 @@ def test_a_broken_transport_is_categorised_not_echoed(db, monkeypatch, exc):
         body = trigger(c, h)
         log = c.get("/v1/admin/notifications?limit=200", headers=h).json()
 
-    assert body["notifications"].get("failed") == 8
+    assert body["notifications"].get("failed") == backend.ALERT_RATE_MAX
     blob = repr(log)
     assert SECRET_PW not in blob
     assert "nope" not in blob
+
+
+# ===========================================================================
+# L. alert volume ceiling and the two-rule address flag
+# ===========================================================================
+#
+# Both were added after the demo trigger, and both change what a burst does to a
+# mailbox, so the demo is the cheapest place to exercise them end to end: it
+# produces exactly eight alertable decisions on one address on demand.
+
+def test_the_alert_ceiling_caps_delivery_but_records_the_rest(db, monkeypatch):
+    """Five delivered, three throttled, nothing lost.
+
+    The property that matters is the sum: every alertable event is accounted for
+    in the notification log whether or not an email left the process. A ceiling
+    that silently discarded the overflow would mean the log implied a quieter
+    incident than actually happened.
+    """
+    fake, _ = pinned(score=91.4, decision="BLOCK")
+    monkeypatch.setattr(backend.Scorer, "score", fake)
+    with app_run() as c:
+        h = admin(c)
+        backend.STATE["email_recipients"] = ("analyst@example.com",)
+        body = trigger(c, h)
+        log = c.get("/v1/admin/notifications?limit=200", headers=h).json()
+
+    counts = body["notifications"]
+    assert counts.get("sent") == backend.ALERT_RATE_MAX
+    assert counts.get(nf.STATUS_THROTTLED) == (backend.DEMO_ATTEMPTS
+                                               - backend.ALERT_RATE_MAX)
+    assert sum(counts.values()) == backend.DEMO_ATTEMPTS
+
+    throttled = [i for i in log["items"] if i["status"] == nf.STATUS_THROTTLED]
+    assert len(throttled) == backend.DEMO_ATTEMPTS - backend.ALERT_RATE_MAX
+    for i in throttled:
+        assert i["error_category"] == "rate_limited"
+        assert i["sent_at"] is None
+
+
+def test_a_throttled_alert_is_not_recorded_as_a_failure(db, monkeypatch):
+    """Nothing malfunctioned. Calling it a failure would send an operator hunting
+    for a broken mail server and would bury real transport failures."""
+    fake, _ = pinned(score=91.4, decision="BLOCK")
+    monkeypatch.setattr(backend.Scorer, "score", fake)
+    with app_run() as c:
+        h = admin(c)
+        backend.STATE["email_recipients"] = ("analyst@example.com",)
+        body = trigger(c, h)
+        entries = audit_entries(c, h)
+
+    assert "failed" not in body["notifications"]
+    assert not [e for e in entries if e["action"] == backend.NOTIFICATION_FAILED]
+    throttled = [e for e in entries
+                 if e["action"] == backend.NOTIFICATION_THROTTLED]
+    assert len(throttled) == backend.DEMO_ATTEMPTS - backend.ALERT_RATE_MAX
+    for e in throttled:
+        assert e["after"]["status"] == nf.STATUS_THROTTLED
+        assert e["after"]["error_category"] == "rate_limited"
+        assert e["after"]["is_ground_truth"] is False
+
+
+def test_a_throttled_event_stays_eligible_once_the_window_clears(db, monkeypatch):
+    """The withheld alert must not be permanently suppressed.
+
+    Throttling deliberately does NOT add the dedupe key to the seen set. If it
+    did, a volume control would become silent alert loss: the event would be
+    treated as already-notified forever.
+    """
+    fake, _ = pinned(score=91.4, decision="BLOCK")
+    monkeypatch.setattr(backend.Scorer, "score", fake)
+    with app_run() as c:
+        h = admin(c)
+        backend.STATE["email_recipients"] = ("analyst@example.com",)
+        body = trigger(c, h)
+        # The dedupe key of a BLOCK alert is derived from its transaction id, so
+        # it can be recomputed without the endpoint having to publish it.
+        throttled_ids = {r["transaction_id"] for r in body["results"]}
+        seen = backend.STATE["notified"]
+        marked = {t for t in throttled_ids
+                  if nf.dedupe_key("BLOCK", t) in seen}
+        # Exactly the delivered ones are marked; the throttled ones are not, so
+        # they remain eligible once the window clears.
+        assert len(marked) == backend.ALERT_RATE_MAX, (
+            f"{len(marked)} of {len(throttled_ids)} keys were marked as notified; "
+            f"expected only the {backend.ALERT_RATE_MAX} that were delivered")
+    assert body["attempts_generated"] == backend.DEMO_ATTEMPTS
+
+
+def test_the_address_alert_is_exempt_from_the_ceiling(db, monkeypatch):
+    """The failure this exemption exists to prevent.
+
+    Per-transaction alerts arrive BEFORE the address crosses its decline rule, so
+    without the exemption they consume the whole budget and the one message that
+    summarises the attack is throttled -- the ceiling burying the alert it was
+    added to protect.
+    """
+    fake, _ = pinned(score=91.4, decision="BLOCK")
+    monkeypatch.setattr(backend.Scorer, "score", fake)
+    with app_run() as c:
+        h = admin(c)
+        backend.STATE["email_recipients"] = ("analyst@example.com",)
+        body = trigger(c, h)
+        log = c.get("/v1/admin/notifications?limit=200", headers=h).json()
+
+    assert body["ip_flagged"] is True
+    ip_alerts = [i for i in log["items"]
+                 if i["event_type"] == nf.EVENT_SUSPICIOUS_IP]
+    assert len(ip_alerts) == 1
+    assert ip_alerts[0]["status"] == nf.STATUS_SENT, \
+        "the summary alert was throttled by per-transaction noise"
+    assert nf.EVENT_SUSPICIOUS_IP in backend.ALERT_RATE_EXEMPT
+
+
+def test_the_demo_trips_the_breadth_rule_not_the_volume_rule(db):
+    """Eight declines is under the volume threshold of 10, but the demo rotates
+    through four methods, so the breadth rule is what raises the address.
+
+    Worth pinning: it means the demo still demonstrates the address flag after the
+    volume threshold was raised from 3 to 10, without the attempt count changing.
+    """
+    with app_run() as c:
+        h = admin(c)
+        body = trigger(c, h)
+        ips = c.get("/v1/admin/suspicious-ips", headers=h).json()
+
+    assert body["attempts_generated"] < backend.IP_FAIL_THRESHOLD
+    assert body["ip_flagged"] is True
+    flagged = [i for i in ips["items"] if i["ip_hash"] == body["ip_hash"]]
+    assert flagged, "the demo address was not flagged"
+    assert len(set(backend.DEMO_ATTACK_METHODS)) >= backend.IP_METHOD_THRESHOLD
+
+
+def test_the_address_alert_lists_instruments_but_no_card_data(db, monkeypatch):
+    """The alert carries what an analyst pivots on -- method, masked display and
+    the HMAC reference -- and nothing a mailbox must not hold."""
+    transport = FakeTransport()
+    with app_run() as c:
+        backend.STATE["email_provider"] = nf.SMTPEmailProvider(
+            host="smtp.example.com", sender="alerts@example.com",
+            password=SECRET_PW, transport=transport)
+        backend.STATE["email_recipients"] = ("analyst@example.com",)
+        trigger(c, admin(c))
+
+    ip_alerts = [m for m in transport.messages
+                 if "Suspicious IP detected" in m[0]["Subject"]]
+    assert len(ip_alerts) == 1
+    text = ip_alerts[0][0].get_content()
+
+    assert "Instruments declined from this address" in text
+    assert "No card number, CVV" in text
+    # The demo constructs no instrument, so the references are its synthetic
+    # placeholders -- but the shape is what is being asserted: a method and a
+    # display per line, and nothing PAN-shaped anywhere.
+    assert "demo card" in text
+    assert not re.search(r"\b\d{13,19}\b", text)
+    assert SECRET_PW not in text
+
+
+def test_the_rules_are_published_for_an_analyst(db):
+    """A flag an analyst cannot explain is not actionable. Both detectors are
+    described on the endpoint rather than living only in the code."""
+    with app_run() as c:
+        h = admin(c)
+        ips = c.get("/v1/admin/suspicious-ips", headers=h).json()
+
+    names = {r["name"] for r in ips["rules"]}
+    assert names == {"volume", "breadth"}
+    volume = next(r for r in ips["rules"] if r["name"] == "volume")
+    breadth = next(r for r in ips["rules"] if r["name"] == "breadth")
+    assert volume["threshold"] == backend.IP_FAIL_THRESHOLD == 10
+    assert volume["window_minutes"] == 20
+    assert breadth["threshold"] == backend.IP_METHOD_THRESHOLD == 3
+    assert breadth["window_minutes"] == 120
+    # The legacy fields keep their meaning so an existing consumer is unaffected.
+    assert ips["threshold"] == backend.IP_FAIL_THRESHOLD
+    assert ips["window_minutes"] == 20
+
+
+def test_cash_on_delivery_is_no_longer_offered(db):
+    """COD carries no instrument to fingerprint and cannot be declined by a
+    gateway, so it was the one method the engine had nothing to say about."""
+    with app_run() as c:
+        offered = {m["code"] for m in c.get("/v1/catalog/products").json()
+                   ["payment_methods"]}
+        assert "cod" not in offered
+        assert offered == {"upi", "card", "netbanking", "wallet"}
+
+        h = register(c, f"cod-{uuid.uuid4().hex[:8]}@example.com")
+        r = c.post("/v1/orders", headers=h, json={
+            "items": [{"product_id": "p1", "qty": 1}],
+            "payment_method": "cod",
+            "device_fp": "dev_cod_001",
+        })
+        assert r.status_code == 422
+
+    # But it REMAINS in the trained feature matrix. The model carries a method_cod
+    # one-hot column, so removing it there would change the feature vector out from
+    # under the artifact and break offline/online parity.
+    assert "cod" in backend.PAYMENT_METHODS
+
+
+def test_the_scenario_does_not_depend_on_the_time_of_day(db, monkeypatch):
+    """The baseline's shopping hours are anchored relative to the attack.
+
+    THE BUG THIS PINS. With a fixed 18:00-21:00 baseline, `hour_deviation` measured
+    the attack's distance from an absolute clock time, so the demo scored
+    differently depending on when somebody ran it: at 08:00 all eight attempts
+    blocked, and at 16:00 the UPI and wallet attempts fell to 69.5 and 47.5, under
+    the block threshold. They then settled successfully, the address never
+    accumulated three distinct failed methods, and the suspicious-IP alert silently
+    stopped happening.
+
+    Anchoring keeps the deviation constant rather than removing it. This asserts the
+    invariant directly -- the gap between the customer's habitual hour and the
+    attack hour is the same whatever hour it is -- rather than trying to run the
+    scenario at 24 different times.
+    """
+    hours = set()
+    for pretend_hour in (0, 3, 8, 13, 16, 21, 23):
+        # A `now` pinned to a specific UTC hour, passed explicitly. The scenario
+        # builder takes `now` as an argument precisely so this is possible without
+        # patching the clock.
+        now = datetime(2026, 8, 29, pretend_hour, 30, tzinfo=timezone.utc).timestamp()
+        store = backend.InMemoryStore()
+        summary = backend.demo_seed_history(store, "cust_hours", now)
+        assert summary["transactions"] == backend.DEMO_BASELINE_TXNS
+
+        c = store.customer("cust_hours")
+        attack_hour = datetime.fromtimestamp(now, tz=timezone.utc).hour
+        # The deviation the engine would compute for a transaction at the attack
+        # hour, against the profile the baseline just built.
+        hours.add(round(c.hour.deviation(attack_hour + 0.5), 3))
+
+    # The deviation is STRONG at every hour, which is the property that keeps the
+    # decisions stable. It is not bit-identical across hours, and that is expected:
+    # `RunningHour.mad` accumulates against a moving mean seeded at 12.0, so a
+    # baseline window straddling midnight converges slightly differently. The spread
+    # that matters is the one that used to drop attempts under the block threshold,
+    # and this floor is far above it.
+    assert min(hours) > 5.0, (
+        f"hour_deviation collapses at some hour: {sorted(hours)}. The baseline is "
+        f"no longer anchored to the attack hour, so the demo's decisions will vary "
+        f"with the time of day.")
+    # Bounded too, so a future change cannot quietly turn this into a constant.
+    assert max(hours) - min(hours) < 3.0, sorted(hours)

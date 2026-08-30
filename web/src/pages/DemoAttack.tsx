@@ -181,15 +181,12 @@ export default function DemoAttack({
                     marked <code>demo</code>, and they are not cleaned up
                     afterwards &mdash; the point is to investigate them.
                   </p>
+                  {/* One affirmative action. Cancel lives in the dialog header,
+                      where it already is for the payment sheet, rather than being
+                      offered twice. */}
                   <div className="row row-tight">
                     <button className="btn btn-danger btn-sm" onClick={() => void run()}>
                       Generate {status.attempts} attempts
-                    </button>
-                    <button
-                      className="btn btn-ghost btn-sm"
-                      onClick={() => setStage('idle')}
-                    >
-                      Cancel
                     </button>
                   </div>
                 </div>

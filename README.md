@@ -479,7 +479,7 @@ This layer changed no behaviour. It names the behaviour that already existed so 
 1. **Fired rules** → templated English via `RULE_TEXT`, e.g. `"{txn_count_10m:.0f} attempts in 10 minutes"`. Severity `high` when the rule is worth ≥15 points.
 2. **Model attributions** → top 5 features by absolute contribution, positive-only, mapped through `SHAP_TEXT`, tagged `source: "model"` with the numeric contribution attached.
 
-**On the word SHAP.** The `shap` package is **deliberately not a dependency**. Attributions come from XGBoost's native `predict(..., pred_contribs=True)`, which is exact TreeSHAP computed inside the booster. Same values, no extra dependency, no sampling approximation. The code and `requirements-serve.txt` both say so explicitly.
+**On the word SHAP.** The `shap` package is **deliberately not a dependency**. Attributions come from XGBoost's native `predict(..., pred_contribs=True)`, which is exact TreeSHAP computed inside the booster. Same values, no extra dependency, no sampling approximation. The code and `requirements.txt` both say so explicitly.
 
 **Not implemented:** no LLM anywhere in the repository. No `openai`, `anthropic`, `bedrock`, `langchain`, or any model API call. Explanations are template-based. This is a defensible choice for a fraud path — templates are deterministic, auditable and reproducible — but the spec's optional "structured evidence → LLM → prose" layer does not exist.
 
@@ -598,7 +598,7 @@ Two implementation details that are load-bearing, both documented in the code:
 | **A Razorpay account** | Test Mode requires a registered business account. This project has none | The user signs up; nobody else can do this step |
 | **Test-mode keys** (`rzp_test_…`) | Follow from the account | Paste into `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` |
 | **Any executed call to Razorpay** | No credentials ⇒ no request has ever been sent. `order.create` and `payment.fetch` have only ever run against a mock | Set the two variables and `FRAUDSHIELD_PAYMENT_PROVIDER=razorpay` |
-| The `razorpay` SDK as a hard dependency | Commented out in `requirements-serve.txt` on purpose, since the default provider never needs it | `pip install razorpay==1.4.2` |
+| The `razorpay` SDK as a hard dependency | Commented out in `requirements.txt` on purpose, since the default provider never needs it | `pip install razorpay==1.4.2` |
 | Verification against Razorpay's **real** signatures | Only ever verified against our own emitter's HMAC. The algorithm matches their documentation, but "matches the docs" is not "matches their bytes" | Register the webhook URL in their dashboard and receive one real delivery |
 | Confirmation that the payload shape is accepted | Field names come from Razorpay's published API reference, not from a 200 response | One live `order.create` |
 
@@ -627,7 +627,7 @@ This is the path used for every demo, every screenshot and 358 of the 436 tests.
 Only meaningful if you have a Razorpay account. Nothing in this repository can substitute for one.
 
 ```bash
-pip install razorpay==1.4.2          # deliberately not in requirements-serve.txt
+pip install razorpay==1.4.2          # deliberately not in requirements.txt
 ```
 
 ```env
@@ -731,7 +731,7 @@ A webhook arrives from the **provider's servers**, not the payer's browser, so `
 
 ## 16. API Documentation
 
-31 routes, enumerated by introspecting `backend.app.routes`. All exist. All 13 `/v1/admin/*` routes enforce a role — verified programmatically, not by inspection.
+33 routes, enumerated by introspecting `backend.app.routes` and excluding FastAPI's own `/docs`, `/redoc` and `/openapi.json`. All exist. All 15 `/v1/admin/*` routes enforce a role — verified programmatically, not by inspection.
 
 ### Authentication
 
@@ -780,6 +780,7 @@ A webhook arrives from the **provider's servers**, not the payer's browser, so `
 | POST | `/v1/admin/promo-holds/{rid}/override` | Grant anyway, creates a label | analyst, admin | ✅ |
 | GET | `/v1/admin/suspicious-ips` | Flagged addresses + evidence | analyst, admin | ✅ |
 | GET | `/v1/admin/failed-attempts` | All stored declines | analyst, admin | ✅ |
+| POST | `/v1/admin/demo/fraud-attack` | Generate 8 synthetic attempts through the real engine | **admin only**, demo mode + simulator only | ✅ |
 
 ### Ingestion
 
@@ -947,7 +948,7 @@ Rehydration summary from that run: 6 redemptions examined, 3 open, 1 resolved, 2
 
 Everything else an analyst works from — scored transactions, the review queue, entity counters and graph, and the promo hold queue — is rebuilt from durable records at startup.
 
-**Indexes.** `scripts/create_table.py` creates the table with `PAY_PER_REQUEST` billing and TTL on `ttl`. Its own docstring states the **three GSIs in `docs/ARCHITECTURE.md` §3 are not created**, because nothing reads them yet. So queue-by-decision and history-by-device/IP run from memory, not from an index.
+**Indexes.** `scripts/create_table.py` creates the table with `PAY_PER_REQUEST` billing and TTL on `ttl`. **No GSI is created**, because nothing reads one yet. So queue-by-decision and history-by-device/IP run from memory, not from an index.
 
 ---
 
@@ -1213,6 +1214,22 @@ Mirrors the existing `PaymentProvider` seam. `notifications.py` knows nothing ab
 
 `FRAUDSHIELD_EMAIL_PROVIDER` is explicit: SMTP is never enabled just because a host happens to be set, because a stray value in a shell profile must not start mailing an unknown relay. Request `smtp` without a host or sender and the service logs `EMAIL ALERTS DEGRADED`, reports `degraded: true` on `/health`, and falls back to console. It never crashes, and it never pretends an email was delivered.
 
+### Volume ceiling — five alerts per ten minutes
+
+Deduplication answers "is this the same event twice?". It cannot answer "is anybody going to read the fortieth *distinct* alert this minute?" — eight blocked payments are eight different transactions with eight different dedupe keys, so nothing suppresses them.
+
+`ALERT_RATE_MAX = 5` per `ALERT_RATE_WINDOW = 600s` caps how many alerts leave the process. Over the cap, an alert is recorded with status `throttled`, `error_category: rate_limited`, and its own `NOTIFICATION_THROTTLED` audit event.
+
+Three properties, each of which took a mistake to find:
+
+- **Throttled is not failed.** A separate status and a separate audit action, because nothing malfunctioned — the alert was withheld by policy. Recording it as a failure would send an operator hunting a broken mail server and would bury real transport failures.
+- **A throttled key is not marked as notified.** The dedupe key is deliberately *not* added to the seen set, so the event stays eligible once the window clears. Adding it would turn a volume control into silent, permanent alert loss.
+- **The suspicious-address alert is exempt.** Per-transaction alerts arrive *before* an address crosses its decline rule, so without `ALERT_RATE_EXEMPT` they consumed the whole budget and the one message summarising the attack was throttled — the ceiling burying the alert it exists to protect. A test caught this. `SUSPICIOUS_IP` cannot flood on its own: it is deduplicated to one alert per address for the life of the flag.
+
+The counter is per-process, not distributed. Two instances would each allow five. That is a mailbox-volume control, not a security boundary, and it is stated rather than implied.
+
+Ordering matters too: the ceiling is checked **after** the recipient check. With no recipients configured there is no delivery to ration, and throttling first meant an unrelated suite with alerting switched off started attaching `NOTIFICATION_THROTTLED` events to its transactions.
+
 ### Deduplication — the anti-spam property
 
 A card-testing burst is one situation, not forty. The key is deterministic:
@@ -1291,7 +1308,103 @@ accusation against the customer. ...
 
 ### Honest status
 
-`ConsoleEmailProvider` is fully exercised. `SMTPEmailProvider` is written against the documented `smtplib` surface and tested against an injected fake transport across ten distinct failure modes. **It has not been verified against a live SMTP server by this repository** — that requires credentials which are not shipped, so the claim is not made.
+`ConsoleEmailProvider` is fully exercised. `SMTPEmailProvider` is written against the documented `smtplib` surface and tested against an injected fake transport across ten distinct failure modes.
+
+**The automated suite does not verify live delivery, and cannot**: no credentials are shipped, and CI fails outright if `FRAUDSHIELD_SMTP_PASSWORD`, `FRAUDSHIELD_SMTP_HOST` or `FRAUDSHIELD_ALERT_RECIPIENTS` is set. Separately, **one manual send was performed against `smtp.gmail.com:587` on 2026-08-29 using an operator-supplied app password, and Gmail accepted it** — STARTTLS negotiated, authentication succeeded, message accepted for delivery. That is a single observation about one account on one day, not a property this repository can re-verify, which is why it is recorded here rather than asserted by a test.
+
+The SMTP variables are deliberately **not** set in `.env`. With a provider and recipients configured, the backend test suite would resolve the real provider at every app start and mail an analyst on every BLOCK it generates — hundreds of messages per run. Set them in the shell for a live demo session instead:
+
+```powershell
+$env:FRAUDSHIELD_EMAIL_PROVIDER   = 'smtp'
+$env:FRAUDSHIELD_SMTP_HOST        = 'smtp.gmail.com'
+$env:FRAUDSHIELD_SMTP_PORT        = '587'
+$env:FRAUDSHIELD_SMTP_USE_TLS     = 'true'
+$env:FRAUDSHIELD_ALERT_FROM       = '<the account that owns the app password>'
+$env:FRAUDSHIELD_SMTP_USERNAME    = '<the same account>'
+$env:FRAUDSHIELD_SMTP_PASSWORD    = '<Gmail app password>'
+$env:FRAUDSHIELD_ALERT_RECIPIENTS = '<who should be alerted>'
+uvicorn backend:app --reload
+```
+
+`FRAUDSHIELD_ALERT_FROM` must be the account that owns the app password. Gmail refuses `535 auth_failed` for any other sender, which is exactly what happened on the first attempt of the manual check above.
+
+---
+
+## 20b. Demo Fraud Attack
+
+**Implemented. Admin-only, off by default, and it decides nothing.**
+
+`POST /v1/admin/demo/fraud-attack` generates one realistic suspicious-payment scenario so the engine can be demonstrated in minutes rather than by waiting ten of them at a checkout form.
+
+> **The demo trigger does not assign a fraud score or decision. It generates synthetic transactions and sends them through the same FraudShield scoring pipeline.**
+
+That is the whole design. There is no risk score, decision, sub-score or reason code anywhere in the demo code path. It builds transactions, hands each one to `Scorer.score()` — the same call `create_order` makes — and reports what came back. `tests/test_demo_attack.py` proves it by replacing `Scorer.score` with a stub returning `3.3 / ALLOW` on a ₹45,000 burst and finding exactly that value in the response, the stored transaction and the audit record.
+
+### Two independent safety gates
+
+| Gate | Requirement | Failure |
+|---|---|---|
+| Explicit opt-in | `FRAUDSHIELD_DEMO_MODE=true` | `403` |
+| Simulator only | payment provider is `simulated`, both **requested** and **resolved** | `409` |
+
+Both default closed, and neither is inferred from the other. The simulator being active is a perfectly normal production state for this project — Razorpay Test Mode needs a business account this project does not have — so it cannot be read as consent to inject synthetic traffic. Requesting `razorpay` without credentials falls back to the simulator, and that fallback is **still** refused: the operator asked for a real gateway.
+
+Authorisation is `admin` only. Anonymous `401`, customer `403`, analyst `403`. An analyst reviews evidence; manufacturing evidence is a different authority. `/health` publishes `demo.enabled` plus which gate is closed, so the console hides a control that could only fail rather than offering it.
+
+### The scenario
+
+| | |
+|---|---|
+| Attempts | **8**, fixed. No request body, so no caller can ask for 100,000 |
+| Spacing | 60 seconds, spanning 420s — inside the 600s window `txn_count_10m` counts over |
+| Customer | one synthetic account per run, `demo_cust_<token>`, never a real login |
+| Device | `demo_device_<token>`, fresh per run, the same for all eight attempts |
+| Address | `demo_ip_<token>`, fresh per run, the same for all eight attempts |
+| Amounts | ₹21,999 escalating to ₹44,999 |
+| Methods | card, card, upi, card, netbanking, card, wallet, card |
+
+**Timestamps are explicit arithmetic on one passed-in `now`.** No global clock is changed, `datetime` is not patched, and the velocity implementation is untouched — the deques simply see the timestamps they are given, exactly as they do for the historical CSV replay.
+
+**A believable history comes first.** `amount_ratio` is a deviation from the customer's own running mean, so an account with no history has nothing to deviate from and the anomaly is measured against a stranger. The scenario therefore replays 60 ordinary evening purchases averaging ₹2,080 over 84 days on a different, familiar device, on an account aged 96 days. That history is committed through `store.commit()` the way `warm_store()` replays CSV rows: **not scored, not persisted, not queued, not audited**, because it is context rather than decisions FraudShield made — and recording it as scored transactions would mean inventing scores for it.
+
+The 60-transaction depth is a property of the running-mean feature, not a tuned threshold. With only a handful of prior transactions, eight large amounts drag the mean up fast enough that `amount_anomaly` stops firing by the fifth attempt. Nothing in `RULE_POINTS`, the layer weights or the decision thresholds was touched.
+
+### Signals it actually produces
+
+Measured, not predicted. Against the shipped model with `review=5, block=70`:
+
+| Signal | Fires | Evidence |
+|---|---|---|
+| `amount_anomaly` | attempts 1–8 | ratio 10.6 falling to 8.6 as the mean climbs |
+| `new_device` | attempt 1 only | after that the device is known to the account |
+| `velocity_breach` | attempts 7–8 | `txn_count_10m` must exceed 5, so it cannot fire earlier |
+| `failure_spike` | attempts 7–8 | a BLOCK never reaches a gateway, so all eight settle failed |
+| `method_switching` | attempt 8 | four distinct methods inside the hour |
+| `device_abuse` | **not on run 1** | needs >4 accounts on the device |
+| `ip_concentration` | **not on run 1** | needs >6 accounts on the address |
+| network layer | **0.0 on run 1** | `_network` scores nothing below three accounts in a component |
+
+The last three are reported as absent rather than claimed. `signals` in the response is the union of what the engine returned, never a wish list.
+
+**Repeated runs are fully isolated,** and that was a deliberate reversal. Every run mints its own customer, device and address from one shared token, so the scenario behaves identically the tenth time as the first.
+
+It originally shared one fixed device and address, which made the ring genuinely grow across runs — a nice story that quietly broke the demo. Those identifiers feed `device_account_count`, `ip_account_count` and `device_failure_rate`, all of which are **model features**. So by the third run the account looked established, some attempts fell under the block threshold, and here is the part that mattered: a BLOCK never reaches the gateway and always settles `failed`, but a MANUAL_REVIEW does reach it and usually **succeeds**. Fewer failures meant fewer distinct failed methods, so the address stopped reaching the breadth rule's three — and the suspicious-address alert silently stopped firing the more the demo was used. Reproducibility won.
+
+### Persistence, audit, notification
+
+Everything goes through the existing helpers, not copies of them: `record_scored_transaction()` for the durable write and the review queue, `audit_risk_decision()` for `RISK_DECISION`, `notify_transaction()` for the alert. The generated run survives a restart under the existing model — `rehydrate_state()` restores the queue and the scores, `rehydrate_entity_state()` replays the eight attempts back into the velocity deques and the entity graph, and nothing is re-scored on the way in. The synthetic pre-attack history does **not** survive, because it was never persisted.
+
+**Synthetic activity is labelled.** Every generated transaction carries `demo: true`, and so does the `after` of every audit event it produces. The marker is **omitted entirely** on real traffic rather than written as `demo: false` — the absence is what makes the presence meaningful. One additional `DEMO_ATTACK_TRIGGERED` event records the admin who asked, with identity taken from the verified token and never from a request body.
+
+**No ground truth is created.** `is_ground_truth` is false on every generated event, no `OUTCOME_RECORDED` is emitted, and no transaction carries a label. Synthetic activity is not an observation, and only a human reviewer can create ground truth.
+
+**Nothing is cleaned up.** The analyst needs to investigate the run, so the trigger does not delete it, and no cleanup route exists. The record store has no delete at all, so a demo cannot be used to remove evidence.
+
+**No money moves.** The simulator holds no server-side records and contacts nothing. A BLOCK is refused before the gateway is called, which is why all eight attempts settle `failed`.
+
+### Console control
+
+"Trigger demo fraud attack" sits in the analyst console header, admin-only and only when `/health` reports both gates open. It confirms before generating, shows the pipeline stages while the single request is in flight — honestly labelled as what the request does rather than a live trace of where it is — then reports the attempts, the score and decision the engine returned, the signals that fired, the velocity it saw, the alert outcome in the notification system's own terms, and the audit result. The queue refreshes immediately rather than waiting for the 5-second poll.
 
 ---
 
@@ -1875,10 +1988,10 @@ python -m venv .venv
 .venv\Scripts\activate          # Windows
 # source .venv/bin/activate     # macOS / Linux
 
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 ```
 
-`requirements-dev.txt` includes `requirements-serve.txt` and adds scikit-learn, which training needs.
+One file covers runtime, training and the test suite. It replaced the earlier `requirements-serve.txt` / `requirements-dev.txt` pair; scikit-learn is needed only to fit the calibrator and compute metrics, and `pytest` + `httpx` are declared there now rather than installed ad hoc by CI.
 
 ### Regenerate the ML pipeline (optional — artifacts are committed)
 
@@ -1972,7 +2085,7 @@ docker build -t fraudshield .
 docker run -p 8000:8000 -e FRAUDSHIELD_API_KEY=<key> fraudshield
 ```
 
-> **Note on stale documentation.** The current README predecessor and `docs/` reference `make bootstrap`, `requirements.txt`, `app.main:app`, `docker-compose.yml`, and an `infra/` directory. **None of these exist.** The commands above are the working ones.
+> **Note on stale documentation.** Earlier drafts referenced `make bootstrap`, `app.main:app`, `docker-compose.yml`, and an `infra/` directory. **None of these exist.** They were concentrated in a `docs/` directory, which has since been deleted for exactly that reason. (`requirements.txt` was also on that list and now does exist — it replaced the `requirements-serve.txt` / `requirements-dev.txt` pair.) The commands above are the working ones.
 
 ---
 
@@ -2015,6 +2128,7 @@ Names only. No values.
 | `FRAUDSHIELD_REHYDRATE_TXNS` | How many recent transactions to reload into the console cache at startup (default 200); open review items are never capped |
 | `FRAUDSHIELD_REHYDRATE_GRAPH_TXNS` | How many recent transactions to replay into velocity counters and the entity graph (default 5,000) |
 | `FRAUDSHIELD_PAYMENT_PROVIDER` | `simulated` (default) or `razorpay`. Explicit — credentials alone never switch providers |
+| `FRAUDSHIELD_DEMO_MODE` | Enables `POST /v1/admin/demo/fraud-attack`. **Default false.** Not inferred from the provider, and the endpoint additionally refuses to run unless the gateway is the simulator |
 | `AWS_ACCESS_KEY_ID` | AWS credential |
 | `AWS_SECRET_ACCESS_KEY` | AWS credential |
 | `RAZORPAY_KEY_ID` | Razorpay Test Mode key id. **Blank in this repository — no account exists** |
@@ -2121,20 +2235,16 @@ AI_Risk_Manager/
 │   ├── grant_role.py            71 — out-of-band role grant
 │   ├── reset_staff.py           47 — delete a seeded staff account
 │   └── emit_webhook.py          — signed event emitter (the simulated provider)
-├── docs/
-│   ├── ARCHITECTURE.md         344
-│   ├── EVALUATION.md           383
-│   ├── RISK_ENGINE.md          297
-│   └── PROBLEM.md              199
 ├── Dockerfile                  serving image, non-root
 ├── pyproject.toml              packaging + pytest config
-├── requirements-serve.txt      runtime deps
-├── requirements-dev.txt        + scikit-learn
-├── pagesoverview.md            page-by-page UI reference
+├── requirements.txt            runtime + training + test deps, one file
 └── .env.example                all secrets blank
 ```
 
-**No** `docker-compose.yml`, `Makefile`, or `infra/`.
+**No** `docker-compose.yml`, `Makefile`, `infra/`, or `docs/`. This README is the
+only prose documentation, deliberately: a `docs/` directory existed and its setup
+instructions had drifted far enough from the code to be actively misleading, so it
+was removed rather than left to rot alongside a README that contradicted it.
 
 ---
 
@@ -2146,7 +2256,7 @@ AI_Risk_Manager/
 
 | Job | Steps |
 |---|---|
-| **Backend** | Python 3.13, pip cache, install `requirements-serve.txt` + `requirements-dev.txt`, credential guard, import check, `python -m pytest` (all 545 tests including both parity suites) |
+| **Backend** | Python 3.13, pip cache, install `requirements.txt`, credential guard, import check, `python -m pytest` (all tests including both parity suites) |
 | **Frontend** | Node 20, npm cache, `npm ci`, `npm run build` (`tsc -b && vite build`, so a type error fails the job), `npm test` (51 vitest tests) |
 
 **It needs no secrets and must never be given any.** Everything runs against the simulated payment provider, the console email provider, a mocked Razorpay SDK client, an injected fake SMTP transport and in-memory stores. There is an explicit guard step that **fails the run** if `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `FRAUDSHIELD_SMTP_PASSWORD`, `FRAUDSHIELD_SMTP_HOST` or `FRAUDSHIELD_ALERT_RECIPIENTS` is present — because if a test ever starts depending on a real external service, "all green" stops meaning what it says.
@@ -2229,7 +2339,7 @@ Closed since the previous revision: promo-override audit, durable thresholds, ri
 ### P0 — required for demo and judging
 
 1. ~~**Razorpay integration.**~~ **Addressed as far as it can be without an account.** The webhook endpoint with HMAC verification exists (§15), and so does the outbound adapter (`payments.RazorpayProvider`) behind an explicit provider switch. What remains is not code: it is a Razorpay business account. The service runs the simulator by default and states which provider it is using on startup, on `/health`, and in the analyst console.
-2. **Stale setup documentation.** `docs/` and prior README text reference `make bootstrap`, `requirements.txt`, `app.main:app`, `docker-compose.yml`, and `infra/` — none exist. A judge following them fails at step one. Partially corrected by this README; `docs/` still needs it.
+2. ~~**Stale setup documentation.**~~ **Closed.** The `docs/` directory referenced `make bootstrap`, `app.main:app`, `docker-compose.yml` and `infra/` — none of which exist — so a judge following it failed at step one. It has been deleted and this README is now the single source of setup instructions.
 3. ~~**Per-decision audit row.**~~ **Done**, and now complete across all four scoring entry points (§22).
 4. ~~**Promo overrides are unaudited.**~~ **Done** — `PROMO_OVERRIDE`, with the machine decision preserved separately from the human verdict (§22).
 
@@ -2239,7 +2349,7 @@ Closed since the previous revision: promo-override audit, durable thresholds, ri
 6. ~~Persist threshold changes so an admin's action survives a restart~~ — **done** (§12).
 7. Have the landing page read `/v1/admin/metrics` or a public metrics endpoint instead of hardcoding.
 8. Fix `pyproject.toml` dependencies — it omits `PyJWT`, `argon2-cffi`, and `boto3`, all of which `backend.py` imports.
-9. Declare `pytest` in `requirements-dev.txt`; it is used but undeclared. CI installs it explicitly as a workaround.
+9. ~~Declare `pytest`; it is used but undeclared. CI installs it explicitly as a workaround.~~ **Done** — `pytest` and `httpx` are both declared in the consolidated `requirements.txt`, and the CI workaround has been removed.
 10. Correct the stale Dockerfile comment claiming "no per-user auth, no roles and no rate limiting" — all three now exist.
 11. ~~Make `GET /v1/admin/audit` able to read more than the current UTC day.~~ **Done** — date, date-range and cursor pagination (§21a).
 
@@ -2264,7 +2374,7 @@ Closed since the previous revision: promo-override audit, durable thresholds, ri
 7. **Dashboard polish** — wire the landing page to live metrics; drop the hardcoded block.
 8. **Failure demo** — rename the artifacts directory live and show `/health` flipping to `model_loaded: false` while checkout keeps serving. Already works; rehearse it.
 9. **Testing** — API tests for `/v1/orders` and the auth flow.
-10. **Final demo prep** — fix stale docs, script the flow, seed data before judging.
+10. **Final demo prep** — script the flow and seed data before judging. (Stale docs: done — the `docs/` directory that carried them has been removed.)
 
 ---
 
@@ -2299,7 +2409,7 @@ The ML and evaluation work remains the strongest part, and it still reports its 
 
 ### Current readiness: **MVP — approaching DEMO READY**
 
-**Why not DEMO READY.** The track is "AI Risk Manager" for merchants "using Razorpay Test Mode," and this project has no Razorpay account, so no part of it has ever talked to Razorpay. A judge checking that requirement now finds *code* — a webhook contract with real HMAC verification and an outbound adapter behind an explicit switch, 100 tests across the two — but no evidence of a live call, because there is none to show. Secondly, following the setup instructions in `docs/` fails, because they reference files that do not exist.
+**Why not DEMO READY.** The track is "AI Risk Manager" for merchants "using Razorpay Test Mode," and this project has no Razorpay account, so no part of it has ever talked to Razorpay. A judge checking that requirement now finds *code* — a webhook contract with real HMAC verification and an outbound adapter behind an explicit switch, 100 tests across the two — but no evidence of a live call, because there is none to show. That is now the only reason: the setup instructions that used to fail lived in a `docs/` directory which has since been deleted, and this README's §24 is the working set.
 
 **What a judge can verify without a Razorpay account.** That the abstraction exists and every checkout goes through it; that scoring happens before authorisation and is unaffected by the provider; that a provider timeout, 4xx, 5xx or malformed response can never be reported as a successful payment; that an `authorized` payment is treated as unresolved rather than paid; that requesting Razorpay without credentials degrades loudly to the simulator instead of failing checkout or pretending; and that no key material appears on `/health`. What they cannot verify is Razorpay's own acceptance of the payload — and neither can this repository.
 
@@ -2312,7 +2422,7 @@ The ML and evaluation work remains the strongest part, and it still reports its 
 - A cost model that makes false positives a first-class metric
 - An evaluation that volunteers its own bad news: block precision of 1.000 flagged as a warning, the ensemble ranking below XGBoost alone, first-party abuse recall of 0.000
 
-**What would make it SUBMISSION READY:** corrected setup docs in `docs/`, and — for the provider criterion — a Razorpay business account. The webhook and the per-decision audit row are both built now. The account is the only item on this list that no amount of engineering time can produce.
+**What would make it SUBMISSION READY:** for the provider criterion, a Razorpay business account. The webhook, the per-decision audit row and corrected setup instructions are all done — the misleading `docs/` directory has been deleted and this README is the single source. The account is the only item on this list that no amount of engineering time can produce.
 
 ### Against the Track 02 bar, item by item
 
@@ -2333,9 +2443,9 @@ The ML and evaluation work remains the strongest part, and it still reports its 
 | 10 | **Audit trail** | 🟡 PARTIAL | All 7 events implemented, immutable, actor from the verified token, filterable, and readable in the console with automated actions separated from human outcomes. Date, date-range and cursor-paginated retrieval, verified against both stores. **Limit: filters are post-read and unindexed, and a range is capped at 31 days per request** |
 | 11 | **Restart durability** | ✅ COMPLETED | Transactions, review queue, promo holds, entity counters (by replay) and now threshold configuration all survive a restart; 142 tests drive real restart lifecycles |
 | 12 | **Graceful failure** | 🟡 PARTIAL | Model-missing fallback with reweighting and an audit event, fail-toward-review on scoring errors, webhook fail-closed, store fallback, provider failures resolve to `pending` never `success`, degraded threshold config surfaced. **Limit: no ML inference timeout, and no retry/backoff on a failed provider call** |
-| 13 | **Demo readiness** | 🟡 PARTIAL | Runs from a clean checkout with no external accounts; webhook and failure demos are scripted and verified. **Limit: `docs/` still contains setup commands for files that do not exist, and there is no Razorpay live call to show** |
+| 13 | **Demo readiness** | 🟡 PARTIAL | Runs from a clean checkout with no external accounts; webhook, failure and synthetic-attack demos are scripted and verified; setup instructions are single-sourced in this README. **Limit: no Razorpay live call to show** |
 
-**REMAINING against the bar:** multi-day audit retrieval, an ML inference timeout, and corrected `docs/`. Two things are permanently outside engineering's reach here — a Razorpay business account, and real (non-synthetic) transaction data.
+**REMAINING against the bar:** an ML inference timeout. Two things are permanently outside engineering's reach here — a Razorpay business account, and real (non-synthetic) transaction data.
 
 **The single most important caveat, stated once more.** Every precision, recall and F1 figure above is measured on data generated by `ml/generate_dataset.py` — written by the same author as the detector. `metrics.json` lists this as its first caveat. Real-world performance will be worse, and no number in this README should be read as a production result.
 
@@ -2344,11 +2454,11 @@ The ML and evaluation work remains the strongest part, and it still reports its 
 ## 34. Final 10 Things To Do
 
 1. ~~Add a Razorpay webhook endpoint with HMAC-SHA256 verification~~ — **done** as `POST /v1/webhooks/payment`, which accepts `X-Razorpay-Signature` and Razorpay's event shape. A second `/v1/webhooks/razorpay` route was deliberately **not** added: Razorpay accepts any configured URL, so an alias would only mean one more public surface to secure and test for no behavioural gain.
-2. ~~Add the Razorpay SDK and the key/secret/webhook-secret names~~ — **done**, with one deliberate difference: the SDK is listed **commented out** in `requirements-serve.txt` and imported lazily, because the default simulated provider never needs it. The three `RAZORPAY_*` names are in `.env.example`, blank, with a note that no account exists.
+2. ~~Add the Razorpay SDK and the key/secret/webhook-secret names~~ — **done**, with one deliberate difference: the SDK is listed **commented out** in `requirements.txt` and imported lazily, because the default simulated provider never needs it. The three `RAZORPAY_*` names are in `.env.example`, blank, with a note that no account exists.
 3. ~~Emit a per-decision audit row from `create_order`~~ — **done**, and now on all four scoring entry points, with exactly one event per committed scoring and none for a `commit=false` preview.
 4. ~~Persist the review queue and entity counters~~ — **done**. Counters are rebuilt by chronological replay rather than stored, which is why a restart reproduces every feature and sub-score exactly.
-5. Fix stale docs across `docs/` and the Dockerfile: no `make bootstrap`, no `requirements.txt`, no `app.main:app`, no `docker-compose.yml`, no `infra/`; auth and roles now exist. **Still outstanding — the highest-value remaining item for a judge.**
-6. Add `PyJWT`, `argon2-cffi`, `boto3` to `pyproject.toml` dependencies and `pytest` to `requirements-dev.txt`. **Still outstanding**; CI installs `pytest` explicitly to work around it.
+5. Fix stale docs across `docs/` and the Dockerfile: no `make bootstrap`, no `app.main:app`, no `docker-compose.yml`, no `infra/`; auth and roles now exist. `requirements.txt` was on this list and now genuinely exists. **Still outstanding — the highest-value remaining item for a judge.**
+6. Add `PyJWT`, `argon2-cffi`, `boto3` to `pyproject.toml` dependencies. **Still outstanding.** The `pytest` half is **done** — `pytest` and `httpx` are declared in the consolidated `requirements.txt` and CI no longer installs them ad hoc.
 7. ~~Persist threshold changes so an admin action survives a restart~~ — **done** (§12), with validation, a safe fallback and a `degraded` flag.
 8. Wire the landing page to a live metrics endpoint and delete the hardcoded `M` block. **Still outstanding.**
 9. ~~Add a GitHub Actions workflow running both parity suites~~ — **done** (§26a). Both parity suites run on every push, plus the frontend build and tests.
@@ -2366,7 +2476,7 @@ The ML and evaluation work remains the strongest part, and it still reports its 
 
 ### Files inspected
 
-**55 files tracked by git.** Read in full or in substantial part during this audit: `backend.py` (2,619 lines), all 6 files in `ml/`, all 6 artifacts in `ml/artifacts/`, both dataset CSVs (measured programmatically), `ml/data/metadata.json`, all 21 files in `web/src/`, both test files, all 3 scripts, `Dockerfile`, `pyproject.toml`, both requirements files, `.env.example`, `.gitignore`, and the 4 files in `docs/`. Route table and feature list were verified by importing the app and introspecting it, not by reading documentation.
+**55 files tracked by git.** Read in full or in substantial part during this audit: `backend.py` (2,619 lines), all 6 files in `ml/`, all 6 artifacts in `ml/artifacts/`, both dataset CSVs (measured programmatically), `ml/data/metadata.json`, all 21 files in `web/src/`, both test files, all 3 scripts, `Dockerfile`, `pyproject.toml`, both requirements files, `.env.example`, `.gitignore`, and the 4 files then in `docs/` (since deleted). Route table and feature list were verified by importing the app and introspecting it, not by reading documentation.
 
 ### Main technologies detected
 
@@ -2377,7 +2487,7 @@ The ML and evaluation work remains the strongest part, and it still reports its 
 **Container:** Docker, `python:3.13-slim`, non-root
 **Not present:** Razorpay SDK, any LLM client, the `shap` package, SQL of any kind, a CI system
 
-> **Update.** The Razorpay SDK is still not installed and still not a hard dependency — `payments.RazorpayProvider` imports it lazily, and `requirements-serve.txt` lists it commented out. So "not present" remains literally true of this environment, and no Razorpay call has ever been executed. What changed is that the adapter that *would* use it now exists (§15).
+> **Update.** The Razorpay SDK is still not installed and still not a hard dependency — `payments.RazorpayProvider` imports it lazily, and `requirements.txt` lists it commented out. So "not present" remains literally true of this environment, and no Razorpay call has ever been executed. What changed is that the adapter that *would* use it now exists (§15).
 
 ### Implementation percentage
 
@@ -2397,7 +2507,7 @@ The ML and evaluation work remains the strongest part, and it still reports its 
 2. **Promo override emits no audit event.** It writes ground truth for that gate without recording who did it.
 3. ~~**No audit UI.**~~ **Closed** — the console has an admin-only **Audit** tab with per-type filters, four visually and textually distinct categories (automated / human / communication / system), an actor and role column, a ground-truth column read from the event, and a banner when the trail may be incomplete. It also has a UTC date selector, an optional date range and cursor pagination.
 4. ~~**Test coverage is 2 tests.**~~ **Now 436 backend tests and 38 frontend tests**, run by GitHub Actions on every push.
-5. **Stale documentation** across `docs/` and the Dockerfile describing commands and limitations that no longer match the code.
+5. ~~**Stale documentation**~~ — the `docs/` directory that described commands and limitations no longer matching the code has been deleted; the Dockerfile comments were corrected.
 
 ### Biggest hackathon risk
 
@@ -2424,3 +2534,44 @@ Verify the `X-Razorpay-Signature` header against the webhook secret, parse a `pa
 ---
 
 *Audit performed by direct source inspection: application introspection for the route table and feature list, programmatic measurement for all dataset figures, and artifact reads for every metric. No figure in this document is estimated, inferred, or carried over from prior documentation.*
+
+---
+
+## 20c. Suspicious-Address Detection — Two Rules
+
+**Implemented.** An operational flag on an *address*, not a score on a transaction. It is not a model feature and it labels nothing.
+
+A single decline is not evidence — cards expire and balances run out. So the trigger is a count inside a window, never a lifetime total. Two rules exist because the same attack has a fast and a slow form, and **either is sufficient**:
+
+| Rule | Trigger | Window | What it catches |
+|---|---|---|---|
+| **VOLUME** | more than **9** declines | **20 minutes** | A machine working a list. Nobody types ten declining payments in twenty minutes by hand |
+| **BREADTH** | **3 or more distinct payment methods** failing | **2 hours** | The patient version — card, then UPI, then netbanking, spread out enough to duck the volume rule |
+
+Constants: `IP_FAIL_THRESHOLD = 10` / `IP_FAIL_WINDOW = 1200s`, `IP_METHOD_THRESHOLD = 3` / `IP_METHOD_WINDOW = 7200s`.
+
+**Why breadth is 3 and not 2.** Two methods failing is an ordinary bad afternoon — an expired card followed by a UPI app having problems. Three distinct instrument *types* failing from one address is somebody working through whatever they have. `IP_METHOD_THRESHOLD = 2` gives the literal reading of "multiple" and will flag noticeably more honest customers.
+
+**Two deques, two windows, deliberately.** `failures` is trimmed to 20 minutes and `method_failures` to 2 hours. Sharing one deque would destroy the breadth count — the same trap the customer velocity counters already document.
+
+**Both counters are always evaluated,** even once an address is flagged, so the console and the alert report live numbers rather than whichever rule happened to trip first. The flag records *which* rule fired (`rule: "volume" | "breadth"`) plus `matched_volume_rule` / `matched_breadth_rule`, because a flag an analyst cannot explain is not actionable.
+
+**Shared infrastructure stays exempt.** Addresses carrying more than 25 accounts are skipped: a carrier NAT or an office range pools unrelated customers' declines through no fault of anyone behind it. Without the carve-out the flag fires on the busiest honest addresses first.
+
+**Both rules survive a restart.** `rehydrate_entity_state()` replays `payment_method` from the `INDEX#TXN` projection, so `method_failures` is rebuilt too. A replay that dropped the method would leave the count intact and silently stop the breadth rule firing after every deploy — which is why the restart test drives three *different* methods rather than three of the same.
+
+### What the alert contains, and what it must never contain
+
+The alert lists every distinct instrument that declined from the address: the method, the masked display (`Visa •••• 4242`), and the HMAC reference (`card_9a8b7c…`). Deduplicated on the reference, because one card retried nine times is one instrument and listing it nine times hides the breadth the alert exists to show.
+
+**No card number, no CVV, no bank credential — in the alert or in the database.**
+
+That is not a reduced version of the evidence, it is the right evidence. The question an analyst asks is "is this the same card as the other four accounts?", and the fingerprint answers it exactly: `card_fingerprint()` is `HMAC-SHA256(digits, pepper)`, so the same card always produces the same value. A PAN in a mailbox would answer it no better and could not be un-leaked. Retaining a CVV after authorisation is prohibited outright by **PCI DSS Requirement 3.2**, and `validate_instrument` discards it upstream, so there is nothing to include even if it were wanted.
+
+For the record, what *is* stored per instrument type: card → HMAC fingerprint + last four; UPI → the VPA; netbanking → the bank code only, because the form never collects a credential; wallet → HMAC of the phone + last four.
+
+### Cash on delivery removed
+
+COD is no longer offered. It carries no instrument to fingerprint, so it produces no card/UPI/wallet reuse signal, and it cannot be declined by a gateway — it was the one method the risk engine had nothing to say about. `OrderRequest` now rejects it with 422 and it is gone from `GET /v1/catalog/products`.
+
+**It remains in `PAYMENT_METHODS` and in `feature_spec.json` on purpose.** The model was trained with a `method_cod` one-hot column; deleting it there would change the feature matrix out from under the artifact and break offline/online parity. Historical COD transactions still score correctly, new ones are simply not offered.

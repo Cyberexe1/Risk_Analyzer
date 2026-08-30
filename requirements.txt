@@ -1,0 +1,72 @@
+# FraudShield -- Python dependencies.
+#
+# One file, covering runtime, the training toolchain and the test suite. Versions
+# are pinned exactly and were verified against the interpreter this repository is
+# developed on (Python 3.13).
+#
+#     pip install -r requirements.txt
+#
+# WHAT USED TO BE HERE
+# --------------------
+# This replaces requirements-serve.txt (runtime only) and requirements-dev.txt
+# (which pulled in the former and added scikit-learn). The split existed so the
+# serving container could avoid installing scikit-learn, pytest and httpx. With one
+# file, `docker build` now installs all three -- see the note in the Dockerfile. If
+# image size or attack surface matters more than having a single file, the split is
+# the thing to restore.
+
+# ---------------------------------------------------------------------------
+# runtime -- everything backend.py imports at serving time
+# ---------------------------------------------------------------------------
+
+numpy==2.2.1
+pandas==2.3.1
+xgboost==3.0.3
+fastapi==0.115.6
+uvicorn==0.49.0
+pydantic==2.13.4
+
+# user auth
+PyJWT==2.10.1
+argon2-cffi==23.1.0
+
+# DynamoDB user + record store (FRAUDSHIELD_USERS_BACKEND=dynamodb)
+boto3==1.40.35
+
+# ---------------------------------------------------------------------------
+# training and evaluation -- ml/*.py only, never touched while serving
+# ---------------------------------------------------------------------------
+#
+# Only used to FIT the isotonic calibrator in ml/train.py and to compute the
+# evaluation metrics. Serving reads the fitted knots from
+# ml/artifacts/calibrator.json and interpolates with numpy, so nothing in the
+# request path imports sklearn.
+scikit-learn==1.7.1
+
+# ---------------------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------------------
+#
+# Both were previously used but undeclared -- CI installed pytest explicitly as a
+# workaround, and httpx was only present because something else had pulled it in.
+# fastapi.testclient / starlette.testclient require httpx, so the suite cannot run
+# without it.
+pytest==8.4.2
+httpx==0.28.1
+
+# ---------------------------------------------------------------------------
+# NOT INSTALLED, on purpose
+# ---------------------------------------------------------------------------
+#
+# shap -- per-row attributions come from XGBoost's native pred_contribs=True,
+#         which is exact TreeSHAP inside the booster. No extra dependency, no
+#         sampling approximation.
+#
+# razorpay -- payments.RazorpayProvider imports the SDK lazily, the same way
+#         DynamoUserStore imports boto3, so the default simulated provider needs no
+#         Razorpay dependency at all. Uncomment ONLY if you have a Razorpay account
+#         and Test Mode credentials:
+#
+#             pip install razorpay==1.4.2
+#
+# razorpay==1.4.2

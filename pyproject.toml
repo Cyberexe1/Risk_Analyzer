@@ -9,8 +9,8 @@ description = "Defense-only transaction risk scoring: detector, explanation, and
 requires-python = ">=3.11"
 license = { text = "MIT" }
 
-# Runtime only. The training toolchain lives in requirements-dev.txt and is not a
-# dependency of the deployed service.
+# Runtime only. The full toolchain -- training, evaluation and tests -- lives in
+# requirements.txt and is not a dependency of the deployed service.
 dependencies = [
     "numpy==2.2.1",
     "pandas==2.3.1",

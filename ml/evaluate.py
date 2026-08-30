@@ -216,8 +216,8 @@ def main() -> None:
     W = (scoring.W_ML, scoring.W_RULES, scoring.W_NETWORK)
     best_w = min(weight_rows, key=lambda r: r["best_cost"])
     print(f"  lowest cost at weights {best_w['weights']}")
-    print(f"  proceeding with the documented {W[0]}/{W[1]}/{W[2]} -- see the note in")
-    print("  docs/EVALUATION.md if these disagree; the measurement wins, not the doc.")
+    print(f"  proceeding with the documented {W[0]}/{W[1]}/{W[2]} -- if these")
+    print("  disagree, the measurement wins, not the README.")
 
     def final_score(frame):
         s = scoring.aggregate(
